@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -155,6 +156,9 @@ class TopKRouter(Router):
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
+
+        from slime.utils.routing_replay import register_routing_replay
+        register_routing_replay(self)
 
     def _maintain_float32_expert_bias(self):
         """

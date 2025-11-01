@@ -1,9 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import os
 import math
 from typing import List, Optional, Union
 
 import torch
+import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ModelCommProcessGroups
@@ -565,6 +567,9 @@ def topk_routing_with_score_function(
             )
         else:
             return torch.topk(scores, k=topk, dim=1)
+
+    from slime.utils.routing_replay import get_routing_replay_compute_topk
+    compute_topk = get_routing_replay_compute_topk(compute_topk)
 
     if score_function == "softmax":
         if use_pre_softmax:
