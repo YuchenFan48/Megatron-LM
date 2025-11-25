@@ -422,7 +422,28 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
             )
+        # ----------------- 统计 Expert 负载 -----------------
 
+        # 1. 确保 routing_map 是整数/浮点类型 (True -> 1, False -> 0)
+        # 否则 .sum() 会出错。使用 .long() 或 .int() 转换。
+        # 形状: [7424, 32] -> long/int [7424, 32]
+        routing_map_int = routing_map.long() 
+        
+        # 2. 沿第一个维度（Token维度，即 dim=0）求和
+        # 结果是一个形状为 [32] 的 Tensor，其中每个元素是对应 Expert 的 Token 计数
+        # [7424, 32] -> sum(dim=0) -> [32]
+        expert_counts_tensor = routing_map_int.sum(dim=0)
+        
+        # 3. 转换为 Python 列表（方便日志记录）
+        expert_counts_list = expert_counts_tensor.tolist()
+
+        # ----------------- 写入日志 -----------------
+
+        # 写入普通的 log.log 文件
+        with open('log.log', 'a') as f:
+            f.write(f"routing_map {routing_map.shape}\n")
+            f.write(f"Expert Load Counts: {expert_counts_list}\n")
+            
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(

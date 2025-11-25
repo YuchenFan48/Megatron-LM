@@ -477,6 +477,9 @@ class GPTModel(LanguageModule):
             if loss_mask is None:
                 # if loss_mask is not provided, use all ones as loss_mask
                 loss_mask = torch.ones_like(mtp_labels)
+            else:
+                # Otherwise, roll the loss_mask to keep up with the mtp_labels
+                loss_mask, _ = roll_tensor(loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params)
             for mtp_layer_number in range(self.config.mtp_num_layers):
                 # output
                 mtp_logits, _ = self.output_layer(
@@ -484,11 +487,23 @@ class GPTModel(LanguageModule):
                     weight=output_weight,
                     runtime_gather_output=runtime_gather_output,
                 )
+                # output_layer_params = {k: v.detach() for k, v in self.output_layer.named_parameters()}
+                # output_layer_buffers = dict(self.output_layer.named_buffers())
+                # mtp_logits, _ = torch.func.functional_call(
+                #     self.output_layer,
+                #     {**output_layer_params, **output_layer_buffers},
+                #     (hidden_states_list[mtp_layer_number + 1],),
+                #     {
+                #         "weight": output_weight.detach() if output_weight else None,
+                #         "runtime_gather_output": runtime_gather_output,
+                #     },
+                #  )
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
                 mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params)
-                loss_mask, num_tokens = roll_tensor(
+                new_loss_mask, num_tokens = roll_tensor(
                     loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params
-                )
+                 )
+                loss_mask = new_loss_mask * loss_mask
                 mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
                 mtp_loss = loss_mask * mtp_loss
                 if self.training:

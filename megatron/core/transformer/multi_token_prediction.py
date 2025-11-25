@@ -536,12 +536,12 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.cp_group = model_comm_pgs.cp
 
         self_attention_spec = self.submodules.transformer_layer.submodules.self_attention
-        attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
-        assert attn_mask_type in SUPPORTED_ATTN_MASK, (
-            f"Multi-Token Prediction (MTP) is not jet supported with "
-            + f"{attn_mask_type} attention mask type."
-            + f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
-        )
+        # attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
+        # assert attn_mask_type in SUPPORTED_ATTN_MASK, (
+        #     f"Multi-Token Prediction (MTP) is not jet supported with "
+        #     + f"{attn_mask_type} attention mask type."
+        #     + f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
+        # )
 
         self.enorm = build_module(
             self.submodules.enorm,
@@ -622,9 +622,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
-        decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=False, keep_graph=False)
+        decoder_input = decoder_input.detach()
 
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=False, keep_graph=False)
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=False)
 
         return input_ids, position_ids, decoder_input, hidden_states
 

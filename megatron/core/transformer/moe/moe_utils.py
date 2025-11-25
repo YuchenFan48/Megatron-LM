@@ -349,6 +349,8 @@ def unpermute(
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."
+        assert drop_and_pad == False, "Drop and Pad must be True"
+        assert drop_and_pad == True, "Drop and Pad must be False"
         if drop_and_pad:
             num_experts = routing_map.size(1)
             num_permuted_tokens = sorted_indices.size(0)
