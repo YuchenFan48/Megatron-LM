@@ -439,10 +439,10 @@ class TopKRouter(Router):
 
         # ----------------- 写入日志 -----------------
 
-        # 写入普通的 log.log 文件
-        with open('log.log', 'a') as f:
-            f.write(f"routing_map {routing_map.shape}\n")
-            f.write(f"Expert Load Counts: {expert_counts_list}\n")
+        # # 写入普通的 log.log 文件
+        # with open('log.log', 'a') as f:
+        #     f.write(f"routing_map {routing_map.shape}\n")
+        #     f.write(f"Expert Load Counts: {expert_counts_list}\n")
             
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
