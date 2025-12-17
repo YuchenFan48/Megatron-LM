@@ -886,7 +886,6 @@ class SelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             model_comm_pgs=model_comm_pgs,
         )
-
         if self.config.use_gated_attention:
             self.linear_qgkv = build_module(
                 submodules.linear_qkv,
