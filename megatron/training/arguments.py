@@ -1199,6 +1199,8 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['post_self_attn_layernorm'] = args.post_self_attn_layernorm
     kw_args['post_mlp_layernorm'] = args.post_mlp_layernorm
     kw_args['use_gated_attention'] = args.use_gated_attention
+    if hasattr(args, 'num_zero_experts'):
+        kw_args['num_zero_experts'] = args.num_zero_experts
 
     # handle quantization config
     # NOTE: Kitchen arguments are only added to the namespace when
@@ -1496,6 +1498,8 @@ def _add_network_size_args(parser):
                        help='If set, use post MLP layernorm.')
     group.add_argument('--use-gated-attention', action='store_true',
                        help='If set, use gated attention as in Qwen3Next')
+    group.add_argument('--num-zero-experts', type=int, default=None,
+                       help='Number of zero experts.')
     group.add_argument('--openai-gelu', action='store_true',
                        help='Use OpenAIs GeLU implementation. This option'
                        'should not be used unless for backward compatibility'

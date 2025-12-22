@@ -471,7 +471,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         if (
             self.config.moe_expert_capacity_factor is not None
-            or self.config.moe_router_padding_for_fp8
+            or self.config.moe_router_padding_for_fp8 or self.config.num_zero_experts is not None
         ):
             # When using token dropping or router padding, output size is dynamic.
             # Need to sync output size GPU->CPU before allocating output buffer

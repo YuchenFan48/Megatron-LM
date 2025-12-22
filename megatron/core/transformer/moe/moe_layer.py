@@ -176,10 +176,19 @@ class MoELayer(BaseMoELayer):
         """
         residual = hidden_states
         probs, routing_map = self.router(hidden_states)
+
+        if self.config.num_zero_experts is not None:
+            zero_expert_weight = probs[:, self.config.num_moe_experts:].sum(dim=-1, keepdim=True) # Shape: [S*B, 1]
+            zero_expert_weight = zero_expert_weight.view(residual.shape[0], residual.shape[1], 1) # Reshape to [S, B, 1]
+            probs = probs[:, :self.config.num_moe_experts]
+            routing_map = routing_map[:, :self.config.num_moe_experts]
+        else:
+            zero_expert_weight = None
+
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
-        return hidden_states, probs, residual
+        return hidden_states, probs, residual, zero_expert_weight
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
@@ -263,12 +272,16 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
-            hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
+            hidden_states, probs, residual, zce_weight = self.router_and_preprocess(hidden_states)
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, shared_expert_output, mlp_bias = self.experts_compute(
                 dispatched_input, probs, residual
             )
             output = self.combine(output, shared_expert_output)
+
+            if zce_weight is not None:
+                output += zce_weight * residual
+
             return output, mlp_bias
 
         if self.moe_layer_recompute:

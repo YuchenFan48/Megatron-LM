@@ -176,6 +176,7 @@ class TransformerConfig(ModelParallelConfig):
     post_self_attn_layernorm: bool = False
     post_mlp_layernorm: bool = False
     use_gated_attention: bool = False
+    num_zero_experts: Optional[int] = None
 
     test_mode: bool = False
     """Whether to run real-time tests."""
