@@ -124,6 +124,19 @@ class TransformerConfig(ModelParallelConfig):
     attention_dropout: float = 0.1
     """Post attention dropout probability."""
 
+    # Hyper-Connections configuration
+    num_residual_streams: int = 1
+    """Number of residual streams for Hyper-Connections. Set to 1 to disable (default)."""
+
+    use_hyper_connections: bool = False
+    """If True, enable Hyper-Connections for transformer layers."""
+
+    hyper_connections_dropout: float = 0.0
+    """Dropout probability for Hyper-Connections."""
+
+    num_fracs: int = 1
+    """Number of fractions for Frac-Connections extension. Default is 1."""
+
     fp32_residual_connection: bool = False
     """If true, move residual connections to fp32."""
 

@@ -450,6 +450,46 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
+        # Initialize Hyper-Connections if enabled
+        self.use_hyper_connections = config.use_hyper_connections
+        self.expand_stream = None
+        self.reduce_stream = None
+        self.hyper_conn_attn = None
+        self.hyper_conn_mlp = None
+        
+        if self.use_hyper_connections and config.num_residual_streams > 1:
+            try:
+                from megatron.core.transformer.hyper_connections import (
+                    get_init_and_expand_reduce_stream_functions,
+                )
+                
+                init_hyper_conn, expand_stream, reduce_stream = \
+                    get_init_and_expand_reduce_stream_functions(
+                        config.num_residual_streams,
+                        num_fracs=config.num_fracs,
+                        dim=config.hidden_size,
+                        disable=False
+                    )
+                
+                self.expand_stream = expand_stream
+                self.reduce_stream = reduce_stream
+                
+                # Initialize hyper-connections for attention and MLP branches
+                self.hyper_conn_attn = init_hyper_conn(
+                    dim=config.hidden_size,
+                    dropout=config.hyper_connections_dropout,
+                )
+                self.hyper_conn_mlp = init_hyper_conn(
+                    dim=config.hidden_size,
+                    dropout=config.hyper_connections_dropout,
+                )
+            except ImportError:
+                logger.warning(
+                    "Hyper-Connections requested but einops not available. "
+                    "Install einops>=0.8.0 to use Hyper-Connections."
+                )
+                self.use_hyper_connections = False
+
     @staticmethod
     def _get_layer_offset(config: TransformerConfig):
         """
@@ -519,6 +559,17 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+        
+        # Apply Hyper-Connections expand if enabled
+        if self.use_hyper_connections and self.expand_stream is not None:
+            # Convert from [s, b, h] to [b, s, h] for hyper-connections
+            residual = residual.transpose(0, 1)  # [s, b, h] -> [b, s, h]
+            residual = self.expand_stream(residual)  # [b, s, h] -> [b*streams, s, h]
+            residual = residual.transpose(0, 1)  # [b*streams, s, h] -> [s, b*streams, h]
+            # Also expand hidden_states for attention/MLP processing
+            hidden_states = hidden_states.transpose(0, 1)  # [s, b, h] -> [b, s, h]
+            hidden_states = self.expand_stream(hidden_states)  # [b, s, h] -> [b*streams, s, h]
+            hidden_states = hidden_states.transpose(0, 1)  # [b*streams, s, h] -> [s, b*streams, h]
 
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
@@ -558,10 +609,30 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
+        
+        # Apply Hyper-Connections for attention branch if enabled
+        if self.use_hyper_connections and self.hyper_conn_attn is not None:
+            # Convert to [b, s, h] format for hyper-connections
+            attention_output, attention_output_bias = attention_output_with_bias
+            residual_hc = residual.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
+            attn_output_hc = attention_output.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
+            
+            # Apply hyper-connections: width_connection + depth_connection
+            branch_input, residuals_updated, residual_kwargs = self.hyper_conn_attn.width_connection(residual_hc)
+            # Use attention output as branch output (simplified approach)
+            branch_output = branch_input + attn_output_hc
+            residual_hc = self.hyper_conn_attn.depth_connection(branch_output, residuals_updated, **residual_kwargs)
+            
+            # Reduce streams and convert back to [s, b, h]
+            residual_hc = residual_hc.transpose(0, 1)  # [b*streams, s, h] -> [s, b*streams, h]
+            residual_hc = residual_hc.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
+            residual_hc = self.reduce_stream(residual_hc)  # [b*streams, s, h] -> [b, s, h]
+            hidden_states = residual_hc.transpose(0, 1)  # [b, s, h] -> [s, b, h]
+        else:
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                    attention_output_with_bias, residual, self.hidden_dropout
+                )
         nvtx_range_pop(suffix="self_attn_bda")
 
         # Residual connection.
@@ -603,6 +674,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+        
+        # Note: Hyper-Connections expand is already applied in _forward_attention
+        # No need to expand again here as hidden_states is already expanded
 
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
@@ -670,10 +744,30 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, self.hidden_dropout
-            )
+        
+        # Apply Hyper-Connections for MLP branch if enabled
+        if self.use_hyper_connections and self.hyper_conn_mlp is not None:
+            # Convert to [b, s, h] format for hyper-connections
+            mlp_output, mlp_output_bias = mlp_output_with_bias
+            residual_hc = residual.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
+            mlp_output_hc = mlp_output.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
+            
+            # Apply hyper-connections: width_connection + depth_connection
+            branch_input, residuals_updated, residual_kwargs = self.hyper_conn_mlp.width_connection(residual_hc)
+            # Use MLP output as branch output (simplified approach)
+            branch_output = branch_input + mlp_output_hc
+            residual_hc = self.hyper_conn_mlp.depth_connection(branch_output, residuals_updated, **residual_kwargs)
+            
+            # Reduce streams and convert back to [s, b, h]
+            residual_hc = residual_hc.transpose(0, 1)  # [b*streams, s, h] -> [s, b*streams, h]
+            residual_hc = residual_hc.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
+            residual_hc = self.reduce_stream(residual_hc)  # [b*streams, s, h] -> [b, s, h]
+            hidden_states = residual_hc.transpose(0, 1)  # [b, s, h] -> [s, b, h]
+        else:
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                    mlp_output_with_bias, residual, self.hidden_dropout
+                )
         nvtx_range_pop(suffix="mlp_bda")
 
         # Jit compiled function creates 'view' tensor. This tensor
