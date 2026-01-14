@@ -1723,6 +1723,17 @@ def _add_regularization_args(parser):
                        help='Post attention dropout probability.')
     group.add_argument('--hidden-dropout', type=float, default=0.1,
                        help='Dropout probability for hidden state transformer.')
+    
+    # Hyper-Connections arguments
+    group.add_argument('--use-hyper-connections', action='store_true',
+                       help='Enable Hyper-Connections for transformer layers.')
+    group.add_argument('--num-residual-streams', type=int, default=1,
+                       help='Number of residual streams for Hyper-Connections. Set to 1 to disable (default).')
+    group.add_argument('--hyper-connections-dropout', type=float, default=0.0,
+                       help='Dropout probability for Hyper-Connections.')
+    group.add_argument('--num-fracs', type=int, default=1,
+                       help='Number of fractions for Frac-Connections extension. Default is 1.')
+    
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
     group.add_argument('--start-weight-decay', type=float,
