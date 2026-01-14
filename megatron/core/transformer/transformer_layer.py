@@ -617,15 +617,23 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             residual_hc = residual.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
             attn_output_hc = attention_output.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
             
-            # Apply hyper-connections: width_connection + depth_connection
+            # Apply hyper-connections: width_connection extracts branch_input from multiple streams
+            # Then we use attention output as the branch output (since attention already processed the input)
             branch_input, residuals_updated, residual_kwargs = self.hyper_conn_attn.width_connection(residual_hc)
-            # Use attention output as branch output (simplified approach)
-            branch_output = branch_input + attn_output_hc
-            residual_hc = self.hyper_conn_attn.depth_connection(branch_output, residuals_updated, **residual_kwargs)
+            
+            # The branch_input from width_connection should match the attention output shape
+            # We use attention output directly as branch_output since attention already processed the normalized input
+            # Note: In a more complete implementation, we would use branch_input as attention input,
+            # but that would require restructuring the layernorm placement
+            branch_output = attn_output_hc  # Use attention output as branch output
+            
+            # Apply depth connection to add branch output back to residual streams
+            residual_hc = self.hyper_conn_attn.depth_connection(
+                branch_output, residuals_updated, **residual_kwargs
+            )
             
             # Reduce streams and convert back to [s, b, h]
-            residual_hc = residual_hc.transpose(0, 1)  # [b*streams, s, h] -> [s, b*streams, h]
-            residual_hc = residual_hc.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
+            # residual_hc is already in [b*streams, s, h] format from depth_connection
             residual_hc = self.reduce_stream(residual_hc)  # [b*streams, s, h] -> [b, s, h]
             hidden_states = residual_hc.transpose(0, 1)  # [b, s, h] -> [s, b, h]
         else:
@@ -752,15 +760,23 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             residual_hc = residual.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
             mlp_output_hc = mlp_output.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
             
-            # Apply hyper-connections: width_connection + depth_connection
+            # Apply hyper-connections: width_connection extracts branch_input from multiple streams
+            # Then we use MLP output as the branch output (since MLP already processed the input)
             branch_input, residuals_updated, residual_kwargs = self.hyper_conn_mlp.width_connection(residual_hc)
-            # Use MLP output as branch output (simplified approach)
-            branch_output = branch_input + mlp_output_hc
-            residual_hc = self.hyper_conn_mlp.depth_connection(branch_output, residuals_updated, **residual_kwargs)
+            
+            # The branch_input from width_connection should match the MLP output shape
+            # We use MLP output directly as branch_output since MLP already processed the normalized input
+            # Note: In a more complete implementation, we would use branch_input as MLP input,
+            # but that would require restructuring the layernorm placement
+            branch_output = mlp_output_hc  # Use MLP output as branch output
+            
+            # Apply depth connection to add branch output back to residual streams
+            residual_hc = self.hyper_conn_mlp.depth_connection(
+                branch_output, residuals_updated, **residual_kwargs
+            )
             
             # Reduce streams and convert back to [s, b, h]
-            residual_hc = residual_hc.transpose(0, 1)  # [b*streams, s, h] -> [s, b*streams, h]
-            residual_hc = residual_hc.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
+            # residual_hc is already in [b*streams, s, h] format from depth_connection
             residual_hc = self.reduce_stream(residual_hc)  # [b*streams, s, h] -> [b, s, h]
             hidden_states = residual_hc.transpose(0, 1)  # [b, s, h] -> [s, b, h]
         else:
