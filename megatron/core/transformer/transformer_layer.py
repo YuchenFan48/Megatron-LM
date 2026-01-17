@@ -560,16 +560,22 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
         
-        # Apply Hyper-Connections expand if enabled
-        if self.use_hyper_connections and self.expand_stream is not None:
-            # Convert from [s, b, h] to [b, s, h] for hyper-connections
-            residual = residual.transpose(0, 1)  # [s, b, h] -> [b, s, h]
-            residual = self.expand_stream(residual)  # [b, s, h] -> [b*streams, s, h]
-            residual = residual.transpose(0, 1)  # [b*streams, s, h] -> [s, b*streams, h]
-            # Also expand hidden_states for attention/MLP processing
-            hidden_states = hidden_states.transpose(0, 1)  # [s, b, h] -> [b, s, h]
-            hidden_states = self.expand_stream(hidden_states)  # [b, s, h] -> [b*streams, s, h]
-            hidden_states = hidden_states.transpose(0, 1)  # [b*streams, s, h] -> [s, b*streams, h]
+        # Apply Hyper-Connections for attention branch if enabled
+        if self.use_hyper_connections and self.hyper_conn_attn is not None:
+            # Expand residual streams before processing
+            residual_hc = residual.transpose(0, 1)  # [s, b, h] -> [b, s, h]
+            residual_hc = self.expand_stream(residual_hc)  # [b, s, h] -> [b*streams, s, h]
+            
+            # Apply width connection to extract branch input from multiple streams
+            branch_input, residuals_updated, residual_kwargs = self.hyper_conn_attn.width_connection(residual_hc)
+            
+            # Convert branch_input back to [s, b, h] format for attention
+            hidden_states = branch_input.transpose(0, 1)  # [b, s, h] -> [s, b, h]
+            # Store expanded residual for later depth connection
+            residual_hc_expanded = residuals_updated  # [b*streams, s, h] format
+        else:
+            residual_hc_expanded = None
+            residual_kwargs = None
 
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
@@ -610,26 +616,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
         
-        # Apply Hyper-Connections for attention branch if enabled
+        # Apply Hyper-Connections depth connection if enabled
         if self.use_hyper_connections and self.hyper_conn_attn is not None:
-            # Convert to [b, s, h] format for hyper-connections
-            attention_output, attention_output_bias = attention_output_with_bias
-            residual_hc = residual.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
-            attn_output_hc = attention_output.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
+            # Convert attention output to [b, s, h] format for hyper-connections
+            attn_output_hc = attention_output.transpose(0, 1)  # [s, b, h] -> [b, s, h]
             
-            # Apply hyper-connections: width_connection extracts branch_input from multiple streams
-            # Then we use attention output as the branch output (since attention already processed the input)
-            branch_input, residuals_updated, residual_kwargs = self.hyper_conn_attn.width_connection(residual_hc)
-            
-            # The branch_input from width_connection should match the attention output shape
-            # We use attention output directly as branch_output since attention already processed the normalized input
-            # Note: In a more complete implementation, we would use branch_input as attention input,
-            # but that would require restructuring the layernorm placement
-            branch_output = attn_output_hc  # Use attention output as branch output
-            
-            # Apply depth connection to add branch output back to residual streams
+            # Apply depth connection to distribute branch output back to residual streams
             residual_hc = self.hyper_conn_attn.depth_connection(
-                branch_output, residuals_updated, **residual_kwargs
+                attn_output_hc, residual_hc_expanded, **residual_kwargs
             )
             
             # Reduce streams and convert back to [s, b, h]
@@ -683,8 +677,22 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
         
-        # Note: Hyper-Connections expand is already applied in _forward_attention
-        # No need to expand again here as hidden_states is already expanded
+        # Apply Hyper-Connections for MLP branch if enabled
+        if self.use_hyper_connections and self.hyper_conn_mlp is not None:
+            # Expand residual streams before processing
+            residual_hc = residual.transpose(0, 1)  # [s, b, h] -> [b, s, h]
+            residual_hc = self.expand_stream(residual_hc)  # [b, s, h] -> [b*streams, s, h]
+            
+            # Apply width connection to extract branch input from multiple streams
+            branch_input, residuals_updated, residual_kwargs = self.hyper_conn_mlp.width_connection(residual_hc)
+            
+            # Convert branch_input back to [s, b, h] format for MLP
+            hidden_states = branch_input.transpose(0, 1)  # [b, s, h] -> [s, b, h]
+            # Store expanded residual for later depth connection
+            residual_hc_expanded = residuals_updated  # [b*streams, s, h] format
+        else:
+            residual_hc_expanded = None
+            residual_kwargs = None
 
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
@@ -753,26 +761,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
         
-        # Apply Hyper-Connections for MLP branch if enabled
+        # Apply Hyper-Connections depth connection if enabled
         if self.use_hyper_connections and self.hyper_conn_mlp is not None:
-            # Convert to [b, s, h] format for hyper-connections
-            mlp_output, mlp_output_bias = mlp_output_with_bias
-            residual_hc = residual.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
-            mlp_output_hc = mlp_output.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
+            # Convert MLP output to [b, s, h] format for hyper-connections
+            mlp_output_hc = mlp_output.transpose(0, 1)  # [s, b, h] -> [b, s, h]
             
-            # Apply hyper-connections: width_connection extracts branch_input from multiple streams
-            # Then we use MLP output as the branch output (since MLP already processed the input)
-            branch_input, residuals_updated, residual_kwargs = self.hyper_conn_mlp.width_connection(residual_hc)
-            
-            # The branch_input from width_connection should match the MLP output shape
-            # We use MLP output directly as branch_output since MLP already processed the normalized input
-            # Note: In a more complete implementation, we would use branch_input as MLP input,
-            # but that would require restructuring the layernorm placement
-            branch_output = mlp_output_hc  # Use MLP output as branch output
-            
-            # Apply depth connection to add branch output back to residual streams
+            # Apply depth connection to distribute branch output back to residual streams
             residual_hc = self.hyper_conn_mlp.depth_connection(
-                branch_output, residuals_updated, **residual_kwargs
+                mlp_output_hc, residual_hc_expanded, **residual_kwargs
             )
             
             # Reduce streams and convert back to [s, b, h]
