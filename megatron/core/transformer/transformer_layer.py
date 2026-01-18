@@ -622,14 +622,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             attn_output_hc = attention_output.transpose(0, 1)  # [s, b, h] -> [b, s, h]
             
             # Apply depth connection to distribute branch output back to residual streams
+            # DO NOT reduce here - keep multiple streams for MLP branch
             residual_hc = self.hyper_conn_attn.depth_connection(
                 attn_output_hc, residual_hc_expanded, **residual_kwargs
             )
             
-            # Reduce streams and convert back to [s, b, h]
+            # Keep multiple streams - convert back to [s, b*streams, h] format
             # residual_hc is already in [b*streams, s, h] format from depth_connection
-            residual_hc = self.reduce_stream(residual_hc)  # [b*streams, s, h] -> [b, s, h]
-            hidden_states = residual_hc.transpose(0, 1)  # [b, s, h] -> [s, b, h]
+            hidden_states = residual_hc.transpose(0, 1)  # [b*streams, s, h] -> [s, b*streams, h]
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
@@ -679,9 +679,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         
         # Apply Hyper-Connections for MLP branch if enabled
         if self.use_hyper_connections and self.hyper_conn_mlp is not None:
-            # Expand residual streams before processing
-            residual_hc = residual.transpose(0, 1)  # [s, b, h] -> [b, s, h]
-            residual_hc = self.expand_stream(residual_hc)  # [b, s, h] -> [b*streams, s, h]
+            # hidden_states should already be in multi-stream format [s, b*streams, h] from attention
+            # Convert to [b*streams, s, h] format for hyper-connections
+            residual_hc = residual.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
             
             # Apply width connection to extract branch input from multiple streams
             branch_input, residuals_updated, residual_kwargs = self.hyper_conn_mlp.width_connection(residual_hc)
