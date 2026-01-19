@@ -313,6 +313,32 @@ class TransformerBlock(MegatronModule):
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
+        # Initialize Hyper-Connections expand/reduce functions if enabled
+        self.use_hyper_connections = config.use_hyper_connections
+        self.expand_stream = None
+        self.reduce_stream = None
+        
+        if self.use_hyper_connections and config.num_residual_streams > 1:
+            try:
+                from megatron.core.transformer.hyper_connections import (
+                    get_expand_reduce_stream_functions,
+                )
+                
+                self.expand_stream, self.reduce_stream = get_expand_reduce_stream_functions(
+                    config.num_residual_streams,
+                    add_stream_embed=False,
+                    dim=config.hidden_size,
+                    disable=False
+                )
+            except ImportError:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    "Hyper-Connections requested but einops not available. "
+                    "Install einops>=0.8.0 to use Hyper-Connections."
+                )
+                self.use_hyper_connections = False
+
     def _build_layers(self):
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?
@@ -562,6 +588,13 @@ class TransformerBlock(MegatronModule):
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
         with rng_context, outer_fp8_context:
+            # Expand residual streams for Hyper-Connections before layer loop
+            # hidden_states: [s, b, h] -> [s, b*streams, h]
+            if self.use_hyper_connections and self.expand_stream is not None:
+                hidden_states = hidden_states.transpose(0, 1)  # [s, b, h] -> [b, s, h]
+                hidden_states = self.expand_stream(hidden_states)  # [b, s, h] -> [b*streams, s, h]
+                hidden_states = hidden_states.transpose(0, 1)  # [b*streams, s, h] -> [s, b*streams, h]
+
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = self._checkpointed_forward(
@@ -602,6 +635,13 @@ class TransformerBlock(MegatronModule):
                         and self.group_prefetch_offload_commit_async is not None
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+
+            # Reduce residual streams for Hyper-Connections after layer loop
+            # hidden_states: [s, b*streams, h] -> [s, b, h]
+            if self.use_hyper_connections and self.reduce_stream is not None:
+                hidden_states = hidden_states.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
+                hidden_states = self.reduce_stream(hidden_states)  # [b*streams, s, h] -> [b, s, h]
+                hidden_states = hidden_states.transpose(0, 1)  # [b, s, h] -> [s, b, h]
 
         # Final layer norm.
         if self.final_layernorm is not None:

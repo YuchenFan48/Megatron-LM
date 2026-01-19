@@ -48,7 +48,7 @@ def get_expand_reduce_stream_functions(
     dim = None,
     disable = False
 ):
-    if num_streams == 1 or disable:
+    if disable:
         return (nn.Identity(), nn.Identity())
 
     if add_stream_embed:
@@ -232,7 +232,7 @@ class HyperConnections(Module):
         self.static_alpha = nn.Parameter(cat((init_alpha0, torch.eye(num_residual_streams_fracs)), dim = 1))
 
         self.dynamic_alpha_fn = nn.Parameter(torch.zeros(dim, num_residual_streams_fracs + num_input_views_fracs))
-        self.dynamic_alpha_scale = nn.Parameter(torch.ones(()) * 1e-3)  # Reduced from 1e-2 to prevent instability
+        self.dynamic_alpha_scale = nn.Parameter(torch.ones(()) * 1e-2)
 
         # depth connection related (beta)
 
@@ -244,7 +244,7 @@ class HyperConnections(Module):
             dynamic_beta_shape = (dim,) if num_fracs == 1 else (dim, num_fracs) # preserve backwards compat
             self.dynamic_beta_fn = nn.Parameter(torch.zeros(dynamic_beta_shape))
 
-            self.dynamic_beta_scale = nn.Parameter(torch.ones(()) * 1e-3)  # Reduced from 1e-2 to prevent instability
+            self.dynamic_beta_scale = nn.Parameter(torch.ones(()) * 1e-2)
 
         # dropouts
 
@@ -288,17 +288,11 @@ class HyperConnections(Module):
         # alpha for weighted sum of residuals going into branch
 
         wc_weight = self.act(normed @ self.dynamic_alpha_fn)
-        # Clamp scale to prevent it from growing too large (helps with training stability)
-        dynamic_alpha_scale_clamped = torch.clamp(self.dynamic_alpha_scale, min=-0.1, max=0.1)
-        dynamic_alpha = wc_weight * dynamic_alpha_scale_clamped
+        dynamic_alpha = wc_weight * self.dynamic_alpha_scale
 
         static_alpha = rearrange(self.static_alpha, '(f s) d -> f s d', s = streams)
 
         alpha = dynamic_alpha + static_alpha
-        
-        # Add numerical stability: clamp alpha to prevent extreme values
-        # This helps prevent training instability in later stages
-        alpha = torch.clamp(alpha, min=-5.0, max=5.0)  # Tighter bounds
 
         alpha = self.split_fracs(alpha) # (batch, seq, fracs1, streams, fracs2, input + residual streams)
 
@@ -312,17 +306,11 @@ class HyperConnections(Module):
             if not self.has_fracs:
                 dc_weight = rearrange(dc_weight, '... -> ... 1')
 
-            # Clamp scale to prevent it from growing too large (helps with training stability)
-            dynamic_beta_scale_clamped = torch.clamp(self.dynamic_beta_scale, min=-0.1, max=0.1)
-            dynamic_beta = dc_weight * dynamic_beta_scale_clamped
+            dynamic_beta = dc_weight * self.dynamic_beta_scale
 
             static_beta = rearrange(self.static_beta, '... (s f) -> ... s f', s = streams)
 
             beta = dynamic_beta + static_beta
-            
-            # Add numerical stability: clamp beta to prevent extreme values
-            # This helps prevent training instability in later stages
-            beta = torch.clamp(beta, min=-5.0, max=5.0)  # Tighter bounds
 
         mix_h = einsum(alpha, residuals, '... f1 s f2 t, ... f1 s d -> ... f2 t d')
 
@@ -380,18 +368,6 @@ class HyperConnections(Module):
             output = rearrange(output, 'b ... d -> b d ...')
 
         residuals = self.depth_residual_fn(output, residuals)
-        
-        # Add numerical stability: clamp to prevent extreme values
-        # This helps prevent training instability in later stages
-        # Use tighter bounds to prevent gradient explosion
-        residuals = torch.clamp(residuals, min=-50.0, max=50.0)  # Further reduced from 100.0
-        
-        # Additional stability: normalize if values are getting too large
-        # This prevents accumulation of large values across layers
-        residual_norm = torch.norm(residuals, dim=-1, keepdim=True)
-        max_norm = 25.0  # Reduced from 50.0 for stricter control
-        scale = torch.clamp(max_norm / (residual_norm + 1e-8), max=1.0)
-        residuals = residuals * scale
 
         return self.dropout(residuals)
 

@@ -452,8 +452,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # Initialize Hyper-Connections if enabled
         self.use_hyper_connections = config.use_hyper_connections
-        self.expand_stream = None
-        self.reduce_stream = None
+        self.num_residual_streams = config.num_residual_streams
         self.hyper_conn_attn = None
         self.hyper_conn_mlp = None
         
@@ -463,7 +462,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                     get_init_and_expand_reduce_stream_functions,
                 )
                 
-                init_hyper_conn, expand_stream, reduce_stream = \
+                init_hyper_conn, _, _ = \
                     get_init_and_expand_reduce_stream_functions(
                         config.num_residual_streams,
                         num_fracs=config.num_fracs,
@@ -471,17 +470,18 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                         disable=False
                     )
                 
-                self.expand_stream = expand_stream
-                self.reduce_stream = reduce_stream
-                
                 # Initialize hyper-connections for attention and MLP branches
+                # Note: expand_stream and reduce_stream are called in TransformerBlock,
+                # not in individual layers. Each layer only does width_connection and depth_connection.
                 self.hyper_conn_attn = init_hyper_conn(
                     dim=config.hidden_size,
                     dropout=config.hyper_connections_dropout,
+                    layer_index=self.layer_number,
                 )
                 self.hyper_conn_mlp = init_hyper_conn(
                     dim=config.hidden_size,
                     dropout=config.hyper_connections_dropout,
+                    layer_index=self.layer_number,
                 )
             except ImportError:
                 logger.warning(
@@ -561,17 +561,17 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
         
         # Apply Hyper-Connections for attention branch if enabled
+        # Note: hidden_states is already in multi-stream format [s, b*streams, h] from TransformerBlock
         if self.use_hyper_connections and self.hyper_conn_attn is not None:
-            # Expand residual streams before processing
-            residual_hc = residual.transpose(0, 1)  # [s, b, h] -> [b, s, h]
-            residual_hc = self.expand_stream(residual_hc)  # [b, s, h] -> [b*streams, s, h]
+            # Convert to [b*streams, s, h] format for hyper-connections
+            residual_hc = residual.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
             
             # Apply width connection to extract branch input from multiple streams
             branch_input, residuals_updated, residual_kwargs = self.hyper_conn_attn.width_connection(residual_hc)
             
             # Convert branch_input back to [s, b, h] format for attention
             hidden_states = branch_input.transpose(0, 1)  # [b, s, h] -> [s, b, h]
-            # Store expanded residual for later depth connection
+            # Store residuals for later depth connection
             residual_hc_expanded = residuals_updated  # [b*streams, s, h] format
         else:
             residual_hc_expanded = None
@@ -771,10 +771,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 mlp_output_hc, residual_hc_expanded, **residual_kwargs
             )
             
-            # Reduce streams and convert back to [s, b, h]
-            # residual_hc is already in [b*streams, s, h] format from depth_connection
-            residual_hc = self.reduce_stream(residual_hc)  # [b*streams, s, h] -> [b, s, h]
-            hidden_states = residual_hc.transpose(0, 1)  # [b, s, h] -> [s, b, h]
+            # Keep multi-stream format [s, b*streams, h] - reduce_stream is called in TransformerBlock
+            # residual_hc is in [b*streams, s, h] format from depth_connection
+            hidden_states = residual_hc.transpose(0, 1)  # [b*streams, s, h] -> [s, b*streams, h]
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
