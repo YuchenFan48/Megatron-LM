@@ -293,6 +293,9 @@ class HyperConnections(Module):
         static_alpha = rearrange(self.static_alpha, '(f s) d -> f s d', s = streams)
 
         alpha = dynamic_alpha + static_alpha
+        
+        # Numerical stability: clamp alpha to prevent extreme values
+        alpha = torch.clamp(alpha, min=-10.0, max=10.0)
 
         alpha = self.split_fracs(alpha) # (batch, seq, fracs1, streams, fracs2, input + residual streams)
 
@@ -311,6 +314,9 @@ class HyperConnections(Module):
             static_beta = rearrange(self.static_beta, '... (s f) -> ... s f', s = streams)
 
             beta = dynamic_beta + static_beta
+            
+            # Numerical stability: clamp beta to prevent extreme values
+            beta = torch.clamp(beta, min=-10.0, max=10.0)
 
         mix_h = einsum(alpha, residuals, '... f1 s f2 t, ... f1 s d -> ... f2 t d')
 
@@ -368,6 +374,10 @@ class HyperConnections(Module):
             output = rearrange(output, 'b ... d -> b d ...')
 
         residuals = self.depth_residual_fn(output, residuals)
+        
+        # Numerical stability: clamp extreme values to prevent training instability
+        # Use loose bounds that won't affect normal operation but prevent explosions
+        residuals = torch.clamp(residuals, min=-1e4, max=1e4)
 
         return self.dropout(residuals)
 
