@@ -573,8 +573,14 @@ class MultiTokenPredictionLayer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
         )
+        # Disable Hyper-Connections for MTP transformer_layer because:
+        # 1. MTP uses a standalone TransformerLayer, not inside TransformerBlock
+        # 2. The expand_stream/reduce_stream are only called in TransformerBlock
+        # 3. Without expand/reduce, HC's width/depth connections will fail
+        from dataclasses import replace
+        mtp_layer_config = replace(self.config, use_hyper_connections=False)
         self.transformer_layer = build_module(
-            self.submodules.transformer_layer, config=self.config, vp_stage=vp_stage
+            self.submodules.transformer_layer, config=mtp_layer_config, vp_stage=vp_stage
         )
 
         self.final_layernorm = build_module(

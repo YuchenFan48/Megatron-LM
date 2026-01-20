@@ -590,7 +590,14 @@ class TransformerBlock(MegatronModule):
         with rng_context, outer_fp8_context:
             # Expand residual streams for Hyper-Connections before layer loop
             # hidden_states: [s, b, h] -> [s, b*streams, h]
-            if self.use_hyper_connections and self.expand_stream is not None:
+            # HC requires 3D tensor [s, b, h], skip if tensor has different dimensions
+            use_hc_this_forward = (
+                self.use_hyper_connections 
+                and self.expand_stream is not None 
+                and hidden_states.dim() == 3
+            )
+            
+            if use_hc_this_forward:
                 hidden_states = hidden_states.transpose(0, 1)  # [s, b, h] -> [b, s, h]
                 hidden_states = self.expand_stream(hidden_states)  # [b, s, h] -> [b*streams, s, h]
                 hidden_states = hidden_states.transpose(0, 1)  # [b*streams, s, h] -> [s, b*streams, h]
@@ -638,7 +645,7 @@ class TransformerBlock(MegatronModule):
 
             # Reduce residual streams for Hyper-Connections after layer loop
             # hidden_states: [s, b*streams, h] -> [s, b, h]
-            if self.use_hyper_connections and self.reduce_stream is not None:
+            if use_hc_this_forward:
                 hidden_states = hidden_states.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
                 hidden_states = self.reduce_stream(hidden_states)  # [b*streams, s, h] -> [b, s, h]
                 hidden_states = hidden_states.transpose(0, 1)  # [b, s, h] -> [s, b, h]

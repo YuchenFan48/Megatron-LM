@@ -562,7 +562,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         
         # Apply Hyper-Connections for attention branch if enabled
         # Note: hidden_states is already in multi-stream format [s, b*streams, h] from TransformerBlock
-        if self.use_hyper_connections and self.hyper_conn_attn is not None:
+        # HC requires 3D tensor [s, b, h], skip if tensor has different dimensions
+        use_hc_this_forward = (
+            self.use_hyper_connections 
+            and self.hyper_conn_attn is not None 
+            and residual.dim() == 3
+        )
+        
+        if use_hc_this_forward:
             # Convert to [b*streams, s, h] format for hyper-connections
             residual_hc = residual.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
             
@@ -617,7 +624,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         nvtx_range_push(suffix="self_attn_bda")
         
         # Apply Hyper-Connections depth connection if enabled
-        if self.use_hyper_connections and self.hyper_conn_attn is not None:
+        if use_hc_this_forward:
             # Convert attention output to [b, s, h] format for hyper-connections
             attn_output_hc = attention_output.transpose(0, 1)  # [s, b, h] -> [b, s, h]
             
@@ -678,7 +685,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
         
         # Apply Hyper-Connections for MLP branch if enabled
-        if self.use_hyper_connections and self.hyper_conn_mlp is not None:
+        # HC requires 3D tensor [s, b, h], skip if tensor has different dimensions
+        use_hc_mlp_this_forward = (
+            self.use_hyper_connections 
+            and self.hyper_conn_mlp is not None 
+            and residual.dim() == 3
+        )
+        
+        if use_hc_mlp_this_forward:
             # hidden_states should already be in multi-stream format [s, b*streams, h] from attention
             # Convert to [b*streams, s, h] format for hyper-connections
             residual_hc = residual.transpose(0, 1)  # [s, b*streams, h] -> [b*streams, s, h]
@@ -762,7 +776,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         nvtx_range_push(suffix="mlp_bda")
         
         # Apply Hyper-Connections depth connection if enabled
-        if self.use_hyper_connections and self.hyper_conn_mlp is not None:
+        if use_hc_mlp_this_forward:
             # Convert MLP output to [b, s, h] format for hyper-connections
             mlp_output_hc = mlp_output.transpose(0, 1)  # [s, b, h] -> [b, s, h]
             
