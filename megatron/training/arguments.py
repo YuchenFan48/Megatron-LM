@@ -1734,6 +1734,19 @@ def _add_regularization_args(parser):
     group.add_argument('--num-fracs', type=int, default=1,
                        help='Number of fractions for Frac-Connections extension. Default is 1.')
     
+    # Manifold-Constrained Hyper-Connections (mHC) arguments
+    group.add_argument('--use-manifold-hyper-connections', action='store_true',
+                       help='Use Manifold-Constrained Hyper-Connections (mHC) with Sinkhorn projection '
+                            'for more stable training. Requires --use-hyper-connections.')
+    group.add_argument('--mhc-sinkhorn-iters', type=int, default=20,
+                       help='Number of Sinkhorn iterations for mHC. Default is 20.')
+    group.add_argument('--mhc-log-domain-sinkhorn', action='store_true',
+                       help='Use log-domain Sinkhorn for better numerical stability in mHC.')
+    group.add_argument('--mhc-num-dynamic-alpha-proposals', type=int, default=1,
+                       help='Number of dynamic alpha proposals for mHC. Default is 1.')
+    group.add_argument('--log-mhc-amax', action='store_true',
+                       help='Log mHC Amax metrics (spectral norm) for stability monitoring.')
+    
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
     group.add_argument('--start-weight-decay', type=float,
