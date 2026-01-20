@@ -375,6 +375,25 @@ class HyperConnections(Module):
         # needed for memory lanes a la RMT / LMM
 
         self.depth_residual_fn = depth_residual_fn
+        
+        # Store layer index for logging
+        self.layer_index = layer_index
+        
+        # Cache for log_amax monitoring (updated during forward pass)
+        self._last_log_amax = None
+
+    def get_log_amax(self):
+        """
+        Get the log Amax value from the last forward pass.
+        
+        Returns:
+            float or None: The mean log Amax value, or None if no forward pass has been done.
+            
+        Note:
+            For HC (without Sinkhorn), log_amax may deviate from 0, indicating potential
+            signal amplification. For stable training, consider using mHC instead.
+        """
+        return self._last_log_amax
 
     def width_connection(
         self,
@@ -412,6 +431,19 @@ class HyperConnections(Module):
         
         # Numerical stability: clamp alpha to prevent extreme values
         alpha = torch.clamp(alpha, min=-10.0, max=10.0)
+        
+        # Compute log Amax for stability monitoring
+        # For HC (without Sinkhorn), Amax may grow > 1, indicating signal amplification
+        if self.training:
+            with torch.no_grad():
+                # Get the residual mixing part of alpha (excluding pre-branch input)
+                alpha_residual = alpha[..., self.num_input_views:]
+                sample_matrix = alpha_residual
+                if sample_matrix.dim() > 2:
+                    # Take mean over batch/sequence dims, keep last two dims for matrix
+                    while sample_matrix.dim() > 2:
+                        sample_matrix = sample_matrix.mean(dim=0)
+                self._last_log_amax = compute_log_amax(sample_matrix.unsqueeze(0)).item()
 
         alpha = self.split_fracs(alpha) # (batch, seq, fracs1, streams, fracs2, input + residual streams)
 
