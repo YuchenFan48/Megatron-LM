@@ -49,6 +49,9 @@ def sinkhorn_knopps(log_alpha, iters=20):
     """
     Sinkhorn-Knopp algorithm for doubly stochastic matrix normalization.
     This constrains the mixing matrix to prevent signal amplification (Amax stable at ~1.0).
+    
+    Memory optimization: Only the final iteration contributes to gradients.
+    Intermediate iterations use no_grad to save memory.
     """
     dtype = log_alpha.dtype
     log_alpha = log_alpha.float()
@@ -57,22 +60,41 @@ def sinkhorn_knopps(log_alpha, iters=20):
 
     alpha = log_alpha.exp()
 
-    for _ in range(iters):
-        alpha = l1norm(alpha, dim=-2)
-        alpha = l1norm(alpha, dim=-1)
+    # Memory optimization: run most iterations without grad, only last iteration has grad
+    if iters > 1:
+        with torch.no_grad():
+            for _ in range(iters - 1):
+                alpha = l1norm(alpha, dim=-2)
+                alpha = l1norm(alpha, dim=-1)
+        # Detach to cut gradient graph, then do final iteration with grad
+        alpha = alpha.detach().requires_grad_(log_alpha.requires_grad)
+    
+    # Final iteration with gradient
+    alpha = l1norm(alpha, dim=-2)
+    alpha = l1norm(alpha, dim=-1)
 
     return alpha.to(dtype)
 
 def log_domain_sinkhorn_knopps(log_alpha, iters=20):
     """
     Log-domain Sinkhorn-Knopp algorithm for numerical stability.
+    
+    Memory optimization: Only the final iteration contributes to gradients.
     """
     dtype = log_alpha.dtype
     log_alpha = log_alpha.float()
 
-    for _ in range(iters):
-        log_alpha = F.log_softmax(log_alpha, dim=-2)
-        log_alpha = F.log_softmax(log_alpha, dim=-1)
+    # Memory optimization: run most iterations without grad
+    if iters > 1:
+        with torch.no_grad():
+            for _ in range(iters - 1):
+                log_alpha = F.log_softmax(log_alpha, dim=-2)
+                log_alpha = F.log_softmax(log_alpha, dim=-1)
+        log_alpha = log_alpha.detach().requires_grad_(True)
+    
+    # Final iteration with gradient
+    log_alpha = F.log_softmax(log_alpha, dim=-2)
+    log_alpha = F.log_softmax(log_alpha, dim=-1)
 
     return log_alpha.exp().to(dtype)
 
