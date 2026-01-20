@@ -12,6 +12,7 @@ from .hyper_connections import (
     get_init_and_expand_reduce_stream_functions,
     sinkhorn_knopps,
     log_domain_sinkhorn_knopps,
+    compute_log_amax,
 )
 
 __all__ = [
@@ -25,5 +26,6 @@ __all__ = [
     "get_init_and_expand_reduce_stream_functions",
     "sinkhorn_knopps",
     "log_domain_sinkhorn_knopps",
+    "compute_log_amax",
 ]
 

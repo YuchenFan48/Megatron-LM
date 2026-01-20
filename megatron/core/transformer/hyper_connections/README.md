@@ -61,7 +61,33 @@ mHC addresses training instability issues in the original HC by:
 - Using **sigmoid constraints** for pre-branch alpha and beta weights
 - Eliminating the need for explicit clamping
 
-Reference: [mHC Reproduction Blog](https://taylorkolasinski.com/notes/mhc-reproduction-part2/)
+Reference: 
+- [mHC Paper (arXiv:2512.24880)](https://arxiv.org/pdf/2512.24880)
+- [mHC Reproduction Blog](https://taylorkolasinski.com/notes/mhc-reproduction-part2/)
+
+## Monitoring Training Stability with log Amax
+
+The **log Amax** metric is crucial for monitoring training stability (Section 3.1 of the mHC paper).
+
+- **Amax** = spectral norm (max singular value) of the residual mixing matrix H_res
+- In mHC, H_res is constrained to be doubly stochastic via Sinkhorn projection
+- For doubly stochastic matrices: **Amax ≈ 1.0**, so **log Amax ≈ 0**
+
+You can access log Amax during training:
+
+```python
+# After a forward pass, get log_amax from mHC layers
+for layer in model.layers:
+    if hasattr(layer, 'hyper_conn_attn') and layer.hyper_conn_attn is not None:
+        log_amax = layer.hyper_conn_attn.get_log_amax()
+        if log_amax is not None:
+            print(f"Layer {layer.layer_number} attention log_amax: {log_amax:.4f}")
+```
+
+**Interpretation:**
+- `log_amax ≈ 0`: Stable training (Amax ≈ 1.0)
+- `log_amax >> 0`: Signal amplification, potential instability
+- `log_amax << 0`: Signal attenuation
 
 ## Implementation Details
 

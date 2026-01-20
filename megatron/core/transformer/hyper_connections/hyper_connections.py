@@ -76,6 +76,46 @@ def log_domain_sinkhorn_knopps(log_alpha, iters=20):
 
     return log_alpha.exp().to(dtype)
 
+def compute_log_amax(matrix):
+    """
+    Compute log of the maximum singular value (spectral norm) of a matrix.
+    
+    This is a key stability metric from the mHC paper (arXiv:2512.24880).
+    For doubly stochastic matrices (from Sinkhorn projection), Amax ≈ 1.0,
+    so log_amax ≈ 0, indicating stable training.
+    
+    Args:
+        matrix: Tensor of shape (..., n, m) - the mixing matrix H_res
+        
+    Returns:
+        log_amax: Tensor of shape (...) - log of max singular value
+    """
+    # Flatten batch dimensions for SVD
+    original_shape = matrix.shape[:-2]
+    n, m = matrix.shape[-2], matrix.shape[-1]
+    matrix_flat = matrix.reshape(-1, n, m)
+    
+    # Compute singular values (only need the largest one)
+    # Use torch.linalg.svdvals for efficiency (only computes singular values)
+    try:
+        singular_values = torch.linalg.svdvals(matrix_flat.float())
+        amax = singular_values[..., 0]  # Largest singular value
+    except:
+        # Fallback: compute via eigenvalues of M @ M^T
+        mtm = torch.bmm(matrix_flat.float(), matrix_flat.float().transpose(-1, -2))
+        eigenvalues = torch.linalg.eigvalsh(mtm)
+        amax = eigenvalues[..., -1].sqrt()  # sqrt of largest eigenvalue
+    
+    log_amax = torch.log(amax + 1e-8)
+    
+    # Reshape back to original batch dimensions
+    if len(original_shape) > 0:
+        log_amax = log_amax.reshape(original_shape)
+    else:
+        log_amax = log_amax.squeeze()
+    
+    return log_amax
+
 # main functions
 
 def get_expand_reduce_stream_functions(
@@ -632,6 +672,25 @@ class ManifoldConstrainedHyperConnections(Module):
 
         # custom depth connection residual function
         self.depth_residual_fn = depth_residual_fn
+        
+        # Store layer index for logging
+        self.layer_index = layer_index
+        
+        # Cache for log_amax monitoring (updated during forward pass)
+        self._last_log_amax = None
+
+    def get_log_amax(self):
+        """
+        Get the log Amax value from the last forward pass.
+        
+        Returns:
+            float or None: The mean log Amax value, or None if no forward pass has been done.
+            
+        Note:
+            In mHC, log_amax should be close to 0 (Amax ≈ 1.0) due to Sinkhorn projection.
+            If log_amax deviates significantly from 0, it may indicate instability.
+        """
+        return self._last_log_amax
 
     def width_connection(
         self,
@@ -679,6 +738,19 @@ class ManifoldConstrainedHyperConnections(Module):
         alpha_pre = alpha_pre.sigmoid()
 
         alpha_residual = self.residual_mix_constraint_fn(alpha_residual)
+        
+        # Compute log Amax for stability monitoring (paper: arXiv:2512.24880)
+        # For doubly stochastic matrices, Amax ≈ 1.0, so log_amax ≈ 0
+        if self.training:
+            with torch.no_grad():
+                # alpha_residual has shape [..., n, n] where n = num_residual_streams
+                # Compute log_amax over a sample to avoid overhead
+                sample_matrix = alpha_residual
+                if sample_matrix.dim() > 2:
+                    # Take mean over batch/sequence dims, keep last two dims for matrix
+                    while sample_matrix.dim() > 2:
+                        sample_matrix = sample_matrix.mean(dim=0)
+                self._last_log_amax = compute_log_amax(sample_matrix.unsqueeze(0)).item()
 
         alpha = cat((alpha_pre, alpha_residual), dim=-1)
 
