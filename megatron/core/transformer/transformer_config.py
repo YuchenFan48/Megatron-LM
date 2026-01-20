@@ -137,6 +137,19 @@ class TransformerConfig(ModelParallelConfig):
     num_fracs: int = 1
     """Number of fractions for Frac-Connections extension. Default is 1."""
 
+    use_manifold_hyper_connections: bool = False
+    """If True, use Manifold-Constrained Hyper-Connections (mHC) which uses Sinkhorn projection
+    for more stable training. Requires use_hyper_connections=True."""
+
+    mhc_sinkhorn_iters: int = 20
+    """Number of Sinkhorn iterations for mHC. Default is 20."""
+
+    mhc_log_domain_sinkhorn: bool = False
+    """If True, use log-domain Sinkhorn for better numerical stability in mHC."""
+
+    mhc_num_dynamic_alpha_proposals: int = 1
+    """Number of dynamic alpha proposals for mHC. Default is 1."""
+
     fp32_residual_connection: bool = False
     """If true, move residual connections to fp32."""
 

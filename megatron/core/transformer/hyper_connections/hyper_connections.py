@@ -40,6 +40,42 @@ def identity(t):
 def add(x, y):
     return x + y
 
+# sinkhorn functions for manifold-constrained hyper-connections
+
+def l1norm(t, dim):
+    return F.normalize(t, p=1, dim=dim)
+
+def sinkhorn_knopps(log_alpha, iters=20):
+    """
+    Sinkhorn-Knopp algorithm for doubly stochastic matrix normalization.
+    This constrains the mixing matrix to prevent signal amplification (Amax stable at ~1.0).
+    """
+    dtype = log_alpha.dtype
+    log_alpha = log_alpha.float()
+
+    log_alpha = log_alpha - log_alpha.amax(dim=-2, keepdim=True).detach()
+
+    alpha = log_alpha.exp()
+
+    for _ in range(iters):
+        alpha = l1norm(alpha, dim=-2)
+        alpha = l1norm(alpha, dim=-1)
+
+    return alpha.to(dtype)
+
+def log_domain_sinkhorn_knopps(log_alpha, iters=20):
+    """
+    Log-domain Sinkhorn-Knopp algorithm for numerical stability.
+    """
+    dtype = log_alpha.dtype
+    log_alpha = log_alpha.float()
+
+    for _ in range(iters):
+        log_alpha = F.log_softmax(log_alpha, dim=-2)
+        log_alpha = F.log_softmax(log_alpha, dim=-1)
+
+    return log_alpha.exp().to(dtype)
+
 # main functions
 
 def get_expand_reduce_stream_functions(
@@ -64,20 +100,60 @@ def get_expand_reduce_stream_functions(
 
 def get_init_and_expand_reduce_stream_functions(
     num_streams,
-    num_fracs = 1,
-    dim = None,
-    add_stream_embed = False,
-    disable = None
+    num_fracs=1,
+    dim=None,
+    add_stream_embed=False,
+    disable=None,
+    use_manifold_constrained=False,
+    sinkhorn_iters=20,
+    log_domain_sinkhorn=False,
+    num_dynamic_alpha_proposals=1,
+    **kwargs
 ):
+    """
+    Get initialization and expand/reduce stream functions.
+    
+    Args:
+        num_streams: Number of residual streams
+        num_fracs: Number of fractions for Frac-Connections
+        dim: Feature dimension
+        add_stream_embed: Whether to add stream embeddings
+        disable: Force disable Hyper-Connections
+        use_manifold_constrained: If True, use Manifold-Constrained Hyper-Connections (mHC)
+        sinkhorn_iters: Number of Sinkhorn iterations for mHC (default: 20)
+        log_domain_sinkhorn: If True, use log-domain Sinkhorn for mHC
+        num_dynamic_alpha_proposals: Number of dynamic alpha proposals for mHC
+        **kwargs: Additional arguments passed to the Hyper-Connections class
+    
+    Returns:
+        Tuple of (init_hyper_conn_fn, expand_fn, reduce_fn)
+    """
     disable = default(disable, num_streams == 1 and num_fracs == 1)
 
-    hyper_conn_klass = HyperConnections if not disable else Residual
+    if disable:
+        hyper_conn_klass = Residual
+        init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs=num_fracs)
+    elif use_manifold_constrained:
+        # Use Manifold-Constrained Hyper-Connections (mHC) for stable training
+        # Import here to avoid circular dependency since mHC is defined later
+        hyper_conn_klass = ManifoldConstrainedHyperConnections
+        init_hyper_conn_fn = partial(
+            hyper_conn_klass, 
+            num_streams, 
+            num_fracs=num_fracs,
+            sinkhorn_iters=sinkhorn_iters,
+            log_domain_sinkhorn=log_domain_sinkhorn,
+            num_dynamic_alpha_proposals=num_dynamic_alpha_proposals,
+            **kwargs
+        )
+    else:
+        hyper_conn_klass = HyperConnections
+        init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs=num_fracs, **kwargs)
 
-    init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs = num_fracs)
-    expand_reduce_fns = get_expand_reduce_stream_functions(num_streams, add_stream_embed = add_stream_embed, dim = dim, disable = disable)
+    expand_reduce_fns = get_expand_reduce_stream_functions(num_streams, add_stream_embed=add_stream_embed, dim=dim, disable=disable)
 
     if exists(dim):
-        init_hyper_conn_fn = partial(init_hyper_conn_fn, dim = dim)
+        init_hyper_conn_fn = partial(init_hyper_conn_fn, dim=dim)
 
     return (init_hyper_conn_fn, *expand_reduce_fns)
 
@@ -427,6 +503,314 @@ class HyperConnections(Module):
 
 HyperConnections.get_expand_reduce_stream_functions = staticmethod(get_expand_reduce_stream_functions)
 HyperConnections.get_init_and_expand_reduce_stream_functions = staticmethod(get_init_and_expand_reduce_stream_functions)
+
+# manifold-constrained hyper-connections (mHC)
+
+class ManifoldConstrainedHyperConnections(Module):
+    """
+    Manifold-Constrained Hyper-Connections (mHC).
+    
+    Uses Sinkhorn projection to constrain mixing matrices, which:
+    - Prevents signal amplification (keeps Amax stable at ~1.0)
+    - Eliminates the need for explicit clamping
+    - Provides more stable training than vanilla Hyper-Connections
+    
+    Reference: https://taylorkolasinski.com/notes/mhc-reproduction-part2/
+    """
+    def __init__(
+        self,
+        num_residual_streams,
+        *,
+        dim,
+        branch: Module | None = None,
+        layer_index=None,
+        channel_first=False,
+        dropout=0.,
+        residual_transform: Module | None = None,
+        add_branch_out_to_residual=True,
+        num_input_views=1,
+        depth_residual_fn=add,
+        num_fracs=1,
+        sinkhorn_iters=20,
+        log_domain_sinkhorn=False,
+        residual_mix_constraint_fn: Callable | None = None,
+        num_dynamic_alpha_proposals=1,
+    ):
+        """
+        Args:
+            num_residual_streams: Number of residual streams
+            dim: Feature dimension
+            branch: Optional branch module to wrap
+            layer_index: Layer index for deterministic initialization
+            channel_first: If True, expect channel-first format (b, d, ...)
+            dropout: Dropout probability
+            residual_transform: Optional transform for residual (e.g., projection for dimension mismatch)
+            add_branch_out_to_residual: If False, disables depth connections
+            num_input_views: Number of input views for branch
+            depth_residual_fn: Function for combining depth connection output with residual
+            num_fracs: Number of fractions for Frac-Connections extension
+            sinkhorn_iters: Number of Sinkhorn iterations (default: 20)
+            log_domain_sinkhorn: If True, use log-domain Sinkhorn for better numerical stability
+            residual_mix_constraint_fn: Custom constraint function for residual mixing
+            num_dynamic_alpha_proposals: Number of dynamic alpha proposals for averaging
+        """
+        super().__init__()
+
+        self.branch = branch
+
+        # frac-connections paper - num_fracs > 1 for https://arxiv.org/abs/2503.14125
+        assert num_fracs >= 1
+
+        self.num_fracs = num_fracs
+        self.has_fracs = num_fracs > 1
+
+        self.split_fracs = Rearrange('b ... (f d) -> b ... f d', f=num_fracs)
+        self.merge_fracs = Rearrange('b ... f d -> b ... (f d)')
+
+        assert divisible_by(dim, num_fracs), f'feature dimension ({dim}) must be divisible by `num_fracs` ({num_fracs})'
+
+        dim //= num_fracs  # effective dim
+
+        # RMSNorm for normalization
+        self.norm = RMSNorm(dim)
+
+        assert num_residual_streams > 0, '`num_residual_streams` must be greater than 0'
+
+        self.num_residual_streams = num_residual_streams
+        init_residual_index = default(layer_index, randrange(num_residual_streams)) % num_residual_streams
+
+        # parameter dimensions for hyper + frac connections
+        num_residual_streams_fracs = num_residual_streams * num_fracs
+        num_input_views_fracs = num_input_views * num_fracs
+
+        self.num_fracs = num_fracs
+
+        # width num residual streams
+        assert num_input_views >= 1
+        self.num_input_views = num_input_views
+
+        # number of dynamic alpha proposals
+        self.has_dynamic_alpha_proposals = num_dynamic_alpha_proposals > 1
+        self.num_dynamic_alpha_proposals = num_dynamic_alpha_proposals
+
+        # width connection parameters
+        init_alpha0 = torch.zeros((num_residual_streams_fracs, num_input_views_fracs))
+        init_alpha0[init_residual_index, :] = 1.
+
+        self.static_alpha = nn.Parameter(cat((init_alpha0, torch.eye(num_residual_streams_fracs)), dim=1))
+
+        self.dynamic_alpha_fn = nn.Parameter(torch.zeros(num_dynamic_alpha_proposals, dim, num_residual_streams_fracs + num_input_views_fracs))
+
+        self.pre_branch_scale = nn.Parameter(torch.ones(1) * 1e-2)
+        self.residual_scale = nn.Parameter(torch.ones(1) * 1e-2)
+
+        # depth connection related (beta)
+        self.add_branch_out_to_residual = add_branch_out_to_residual
+
+        if add_branch_out_to_residual:
+            self.static_beta = nn.Parameter(torch.ones(num_residual_streams_fracs))
+
+            dynamic_beta_shape = (dim,) if num_fracs == 1 else (dim, num_fracs)
+            self.dynamic_beta_fn = nn.Parameter(torch.zeros(dynamic_beta_shape))
+
+            self.h_post_scale = nn.Parameter(torch.ones(()) * 1e-2)
+
+        # Sinkhorn constraint function
+        self.residual_mix_constraint_fn = default(
+            residual_mix_constraint_fn,
+            partial(sinkhorn_knopps if not log_domain_sinkhorn else log_domain_sinkhorn_knopps, iters=sinkhorn_iters)
+        )
+
+        # dropouts
+        self.dropout = nn.Dropout(dropout)
+
+        # channel first option
+        self.channel_first = channel_first
+
+        # maybe residual transform
+        self.residual_transform = default(residual_transform, nn.Identity())
+
+        # custom depth connection residual function
+        self.depth_residual_fn = depth_residual_fn
+
+    def width_connection(
+        self,
+        residuals
+    ):
+        streams = self.num_residual_streams
+
+        residuals = self.residual_transform(residuals)
+
+        # handle channel first
+        if self.channel_first:
+            residuals = rearrange(residuals, 'b d ... -> b ... d')
+
+        # split out fractions
+        residuals = self.split_fracs(residuals)
+
+        # split out streams
+        residuals = rearrange(residuals, '(b s) ... d -> b ... s d', s=streams)
+
+        # norm
+        normed = self.norm(residuals)
+
+        # alpha for weighted sum of residuals going into branch
+        dtype = residuals.dtype
+
+        normed = normed.float()
+
+        wc_weight = einsum(normed, self.dynamic_alpha_fn.float(), '... d, p d e -> p ... e')
+
+        pre_branch_scale = repeat(self.pre_branch_scale.float(), '1 -> s', s=self.num_fracs)
+        residual_scale = repeat(self.residual_scale.float(), '1 -> s', s=self.num_fracs * streams)
+        alpha_scale = cat((pre_branch_scale, residual_scale))
+
+        alpha_scale = repeat(alpha_scale, 'n -> (v n)', v=self.num_input_views)
+
+        dynamic_alpha = wc_weight * alpha_scale
+
+        static_alpha = rearrange(self.static_alpha.float(), '(f s) d -> f s d', s=streams)
+
+        alpha = dynamic_alpha + static_alpha
+
+        # mHC key difference: alpha is split and "manifold constrained" with sinkhorn and sigmoid
+        alpha_pre, alpha_residual = alpha[..., :self.num_input_views], alpha[..., self.num_input_views:]
+
+        alpha_pre = alpha_pre.sigmoid()
+
+        alpha_residual = self.residual_mix_constraint_fn(alpha_residual)
+
+        alpha = cat((alpha_pre, alpha_residual), dim=-1)
+
+        if self.has_dynamic_alpha_proposals:
+            alpha = reduce(alpha, 'p ... -> ...', 'mean')
+        else:
+            alpha = rearrange(alpha, '1 ... -> ...')
+
+        alpha = self.split_fracs(alpha)
+
+        # beta for weights from branch output back to residual streams
+        beta = None
+
+        if self.add_branch_out_to_residual:
+            dc_weight = normed @ self.dynamic_beta_fn.float()
+
+            if not self.has_fracs:
+                dc_weight = rearrange(dc_weight, '... -> ... 1')
+
+            dynamic_beta = dc_weight * self.h_post_scale.float()
+
+            static_beta = rearrange(self.static_beta.float(), '... (s f) -> ... s f', s=streams)
+
+            beta = dynamic_beta + static_beta
+
+            beta = beta.sigmoid() * 2  # "H_post" manifold constraint
+
+        mix_h = einsum(alpha, residuals.float(), '... f1 s f2 t, ... f1 s d -> ... f2 t d')
+
+        if self.num_input_views == 1:
+            branch_input, residuals = mix_h[..., 0, :], mix_h[..., 1:, :]
+        else:
+            branch_input, residuals = mix_h[..., :self.num_input_views, :], mix_h[..., self.num_input_views:, :]
+            branch_input = rearrange(branch_input, 'b ... v d -> v b ... d')
+
+        if self.channel_first:
+            branch_input = rearrange(branch_input, 'b ... d -> b d ...')
+
+        # merge fractions back
+        branch_input = self.merge_fracs(branch_input)
+
+        residuals = rearrange(residuals, 'b ... f s d -> (b s) ... (f d)')
+
+        branch_input, residuals = tuple(t.to(dtype) for t in (branch_input, residuals))
+
+        if exists(beta):
+            beta = beta.to(dtype)
+
+        return branch_input, residuals, dict(beta=beta)
+
+    def depth_connection(
+        self,
+        branch_output,
+        residuals,
+        *,
+        beta
+    ):
+        assert self.add_branch_out_to_residual
+
+        # split fractions
+        branch_output = self.split_fracs(branch_output)
+
+        # depth connection
+        if self.channel_first:
+            branch_output = rearrange(branch_output, 'b d ... -> b ... d')
+
+        dtype = residuals.dtype
+
+        output = einsum(branch_output.float(), beta.float(), 'b ... f1 d, b ... f1 s f2 -> b ... f2 s d')
+
+        output = rearrange(output, 'b ... s d -> (b s) ... d')
+
+        # merge back fractions
+        output = self.merge_fracs(output)
+
+        # channel first
+        if self.channel_first:
+            output = rearrange(output, 'b ... d -> b d ...')
+
+        residuals = self.depth_residual_fn(output.to(dtype), residuals)
+
+        return self.dropout(residuals)
+
+    def decorate_branch(
+        self,
+        branch: Callable
+    ):
+        assert not exists(self.branch), 'branch was already wrapped on init'
+
+        def forward_and_add_residual(residual, *args, **kwargs):
+            branch_input, add_residual = self.forward(residual)
+
+            branch_output = branch(branch_input, *args, **kwargs)
+
+            residual = add_residual(branch_output)
+
+            return residual
+
+        return forward_and_add_residual
+
+    def forward(
+        self,
+        residuals,
+        *branch_args,
+        **branch_kwargs
+    ):
+
+        branch_input, residuals, residual_kwargs = self.width_connection(residuals)
+
+        def add_residual_fn(branch_out):
+
+            if not self.add_branch_out_to_residual:
+                return branch_out
+
+            (branch_out, *rest), tree_spec = tree_flatten(branch_out)
+
+            branch_out = self.depth_connection(branch_out, residuals, **residual_kwargs)
+
+            return tree_unflatten((branch_out, *rest), tree_spec)
+
+        if not exists(self.branch):
+            return branch_input, add_residual_fn
+
+        branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
+
+        return add_residual_fn(branch_output)
+
+# shorthand alias
+mHC = ManifoldConstrainedHyperConnections
+
+ManifoldConstrainedHyperConnections.get_expand_reduce_stream_functions = staticmethod(get_expand_reduce_stream_functions)
+ManifoldConstrainedHyperConnections.get_init_and_expand_reduce_stream_functions = staticmethod(get_init_and_expand_reduce_stream_functions)
 
 # stream embed
 

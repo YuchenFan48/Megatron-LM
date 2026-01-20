@@ -467,7 +467,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                         config.num_residual_streams,
                         num_fracs=config.num_fracs,
                         dim=config.hidden_size,
-                        disable=False
+                        disable=False,
+                        use_manifold_constrained=config.use_manifold_hyper_connections,
+                        sinkhorn_iters=config.mhc_sinkhorn_iters,
+                        log_domain_sinkhorn=config.mhc_log_domain_sinkhorn,
+                        num_dynamic_alpha_proposals=config.mhc_num_dynamic_alpha_proposals,
                     )
                 
                 # Initialize hyper-connections for attention and MLP branches
