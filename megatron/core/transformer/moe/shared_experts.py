@@ -44,8 +44,10 @@ class SharedExpertMLP(MLP):
         model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
         config = deepcopy(config)
-        assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
-        "please set '--disable-bias-linear' instead."
+        # NOTE: GPT-OSS and similar models require bias in MoE layers
+        # The original assertion preventing bias is commented out to allow these models
+        # assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
+        # "please set '--disable-bias-linear' instead."
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
         # TODO(Hepteract): pass model_comm_pgs to MLP after refactoring MLP

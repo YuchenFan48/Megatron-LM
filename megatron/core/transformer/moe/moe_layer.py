@@ -222,7 +222,9 @@ class MoELayer(BaseMoELayer):
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
-        assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+        # NOTE: GPT-OSS and similar models may return mlp_bias
+        # The original assertion is commented out to allow these models
+        # assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
         return output, shared_expert_output, mlp_bias

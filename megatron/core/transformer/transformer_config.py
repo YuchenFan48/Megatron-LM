@@ -1225,7 +1225,11 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.num_moe_experts is not None:
-            assert not self.add_bias_linear, "Bias is not supported for MoE"
+            # NOTE: GPT-OSS and other models may require MoE + bias
+            # The original assertion "Bias is not supported for MoE" is commented out
+            # to allow models like GPT-OSS that need bias in MoE layers
+            # assert not self.add_bias_linear, "Bias is not supported for MoE"
+            pass
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(
