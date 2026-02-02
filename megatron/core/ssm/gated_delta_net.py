@@ -47,10 +47,10 @@ if not os.path.exists('/apdcephfs/mnt/cephfs/users/yuchenfan/flash-linear-attent
 sys.path.append('/apdcephfs/mnt/cephfs/users/yuchenfan/flash-linear-attention')
 from fla.modules.l2norm import l2norm
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-from fla.modules import ShortConvolution as FLAShortConvolution
+from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
+from einops import rearrange
 
 HAVE_FLA = True
-HAVE_FLA_SHORT_CONV = True
 
 try:
     from causal_conv1d import causal_conv1d_fn
@@ -406,31 +406,22 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_push(suffix="conv1d")
         
         if is_packed:
-            # For packed sequences, use FLA ShortConvolution (best cu_seqlens support)
+            # For packed sequences, use FLA's causal_conv1d with native cu_seqlens support
             # Input qkv is in (batch=1, seq_len, d) format
             
-            if HAVE_FLA_SHORT_CONV and not self.config.deterministic_mode:
-                # Use FLA's ShortConvolution with native cu_seqlens support
-                # Lazy initialization of FLA ShortConvolution wrapper
-                if not hasattr(self, '_fla_short_conv_initialized'):
-                    # Create ShortConvolution without bias (we handle bias separately if needed)
-                    self._fla_short_conv = FLAShortConvolution(
-                        hidden_size=self.conv_dim_local_tp,
-                        kernel_size=self.conv_kernel_dim,
-                        activation=self.activation,
-                        bias=self.conv_bias,
-                    ).to(qkv.device, qkv.dtype)
-                    # Share weights: FLA expects (hidden_size, kernel_size), ours is (hidden_size, 1, kernel_size)
-                    # Replace the parameter with a view of our weight
-                    del self._fla_short_conv.weight
-                    self._fla_short_conv.weight = self.conv1d.weight.squeeze(1)
-                    if self.conv_bias and self.conv1d.bias is not None:
-                        del self._fla_short_conv.bias
-                        self._fla_short_conv.bias = self.conv1d.bias
-                    self._fla_short_conv_initialized = True
+            if HAVE_FLA and not self.config.deterministic_mode:
+                # Use FLA's causal_conv1d directly with cu_seqlens support (Triton kernel)
+                # Weight shape: (d, 1, w) -> (d, w)
+                conv1d_weight = rearrange(self.conv1d.weight, "d 1 w -> d w")
+                conv1d_bias = self.conv1d.bias if self.conv_bias else None
                 
-                # FLA ShortConvolution expects (batch, seq_len, hidden_size) format
-                qkv, _ = self._fla_short_conv(x=qkv, cu_seqlens=cu_seqlens)
+                qkv, _ = fla_causal_conv1d(
+                    x=qkv,
+                    weight=conv1d_weight,
+                    bias=conv1d_bias,
+                    activation=self.activation,
+                    cu_seqlens=cu_seqlens,
+                )
             elif causal_conv1d_fn is not None and not self.config.deterministic_mode:
                 # Fallback to causal_conv1d_fn with seq_idx
                 qkv = qkv.transpose(1, 2)  # (1, seq_len, d) -> (1, d, seq_len)
