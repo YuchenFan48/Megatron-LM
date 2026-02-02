@@ -393,6 +393,9 @@ class GatedDeltaNet(MegatronModule):
         
         Memory usage: O(seq_len/cp_size * hidden)
         This is optimal for very long sequences.
+        
+        Note: This mode is NOT compatible with Megatron's sequence_parallel (SP).
+        When using SEQUENCE_PARALLEL CP mode, set --sequence-parallel to False.
         """
         # Check if using packed sequences (THD format) - not supported in sequence parallel mode
         is_packed = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
@@ -402,8 +405,17 @@ class GatedDeltaNet(MegatronModule):
                 "Please use HEAD_PARALLEL mode for packed sequences."
             )
         
+        # Check for incompatible Megatron sequence_parallel
+        if self.config.sequence_parallel:
+            raise RuntimeError(
+                "SEQUENCE_PARALLEL CP mode is NOT compatible with Megatron's sequence_parallel. "
+                "Please set --sequence-parallel to False, or use HEAD_PARALLEL CP mode. "
+                "SEQUENCE_PARALLEL CP mode already provides sequence memory reduction."
+            )
+        
+        # hidden_states shape: [local_seq_len, batch, hidden]
+        # In SEQUENCE_PARALLEL CP mode, local_seq_len = global_seq_len / cp_size
         local_seq_len, batch, _ = hidden_states.shape
-        local_seq_len = local_seq_len * self.sp_size  # Account for sequence parallel
         
         # Input projection (full hidden dimension, no head sharding)
         nvtx_range_push(suffix="in_proj")
