@@ -39,14 +39,14 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
-try:
-    from fla.modules.l2norm import l2norm
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+import sys
+if not os.path.exists('/apdcephfs/mnt/cephfs/users/yuchenfan/flash-linear-attention'):
+    raise ImportError("Hard code the path to flash-linear-attention in the code -> gated_delta_net.py")
+sys.path.append('/apdcephfs/mnt/cephfs/users/yuchenfan/flash-linear-attention')
+from fla.modules.l2norm import l2norm
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
-    HAVE_FLA = True
-except ImportError:
-    chunk_gated_delta_rule = None
-    l2norm = None
+HAVE_FLA = True
 
     HAVE_FLA = False
 
