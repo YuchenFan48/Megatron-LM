@@ -321,19 +321,23 @@ class GatedDeltaNet(MegatronModule):
         is_packed = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
 
         if is_packed:
-            # Packed sequence: hidden_states shape is (total_tokens, batch=1, hidden_size)
-            total_tokens, batch, _ = hidden_states.shape
+            # Packed sequence: hidden_states shape is (total_tokens_local, batch=1, hidden_size)
+            # where total_tokens_local = total_tokens_global / cp_size
+            total_tokens_local, batch, _ = hidden_states.shape
             assert batch == 1, "Packed sequences should have batch size 1"
-            seq_len = total_tokens * self.sp_size * self.cp_size
-            cu_seqlens = packed_seq_params.cu_seqlens_q
-            # Create seq_idx for conv1d
-            seq_idx = _create_seq_idx_from_cu_seqlens(
-                cu_seqlens, total_tokens, hidden_states.device
-            )
+            # cu_seqlens represents GLOBAL sequence boundaries (same on all CP ranks)
+            cu_seqlens_global = packed_seq_params.cu_seqlens_q
+            # After all-to-all, we'll have the full sequence gathered
+            total_tokens_global = total_tokens_local * self.cp_size
+            seq_len = total_tokens_global * self.sp_size
+            # We'll compute cu_seqlens and seq_idx after all-to-all
+            cu_seqlens = None
+            seq_idx = None
         else:
             seq_len, batch, _ = hidden_states.shape
             seq_len = seq_len * self.sp_size * self.cp_size
             cu_seqlens = None
+            cu_seqlens_global = None
             seq_idx = None
 
         if inference_context is not None:
@@ -349,21 +353,31 @@ class GatedDeltaNet(MegatronModule):
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
-        # CP All to All: CP to HP (skip for packed sequences as they don't use CP typically)
-        if not is_packed:
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=self.pg_collection.cp,
-                split_sections=[
-                    self.qk_dim_local_tp,
-                    self.qk_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.num_value_heads // self.tp_size,
-                    self.num_value_heads // self.tp_size,
-                ],
+        # CP All to All: CP to HP (gather sequence, shard heads)
+        # This applies to both packed and non-packed sequences when CP > 1
+        qkvzba = tensor_a2a_cp2hp(
+            qkvzba,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=self.pg_collection.cp,
+            split_sections=[
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+                self.v_dim_local_tp,
+                self.num_value_heads // self.tp_size,
+                self.num_value_heads // self.tp_size,
+            ],
+        )
+        
+        # For packed sequences, use global cu_seqlens after all-to-all gathering
+        if is_packed:
+            # After all-to-all, we have the full sequence gathered
+            # cu_seqlens_global already represents global sequence boundaries
+            cu_seqlens = cu_seqlens_global
+            # Create seq_idx for the gathered sequence
+            seq_idx = _create_seq_idx_from_cu_seqlens(
+                cu_seqlens, total_tokens_global, hidden_states.device
             )
 
         # Transpose: s b x --> b s x
@@ -371,39 +385,53 @@ class GatedDeltaNet(MegatronModule):
         qkvzba = qkvzba.transpose(0, 1)
 
         # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
+        # After all-to-all, the head dimension is sharded by cp_size for both packed and non-packed
+        qkv, gate, beta, alpha = torch.split(
+            qkvzba,
+            [
+                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
+                self.v_dim_local_tp // self.cp_size,
+                self.num_value_heads // self.tp_size // self.cp_size,
+                self.num_value_heads // self.tp_size // self.cp_size,
+            ],
+            dim=-1,
+        )
+        
         if is_packed:
-            # For packed sequences, don't divide by cp_size
-            qkv, gate, beta, alpha = torch.split(
-                qkvzba,
-                [
-                    self.qk_dim_local_tp * 2 + self.v_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.num_value_heads // self.tp_size,
-                    self.num_value_heads // self.tp_size,
-                ],
-                dim=-1,
-            )
-            # For packed: batch=1, seq_len=total_tokens
-            gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-            beta = beta.reshape(batch, seq_len, -1)
-            alpha = alpha.reshape(batch, seq_len, -1)
+            # For packed: batch=1, seq_len=total_tokens_global (gathered across CP)
+            actual_seq_len = total_tokens_global
         else:
-            qkv, gate, beta, alpha = torch.split(
-                qkvzba,
-                [
-                    (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
-                    self.v_dim_local_tp // self.cp_size,
-                    self.num_value_heads // self.tp_size // self.cp_size,
-                    self.num_value_heads // self.tp_size // self.cp_size,
-                ],
-                dim=-1,
-            )
-            gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-            beta = beta.reshape(batch, seq_len, -1)
-            alpha = alpha.reshape(batch, seq_len, -1)
+            actual_seq_len = seq_len
+            
+        gate = gate.reshape(batch, actual_seq_len, -1, self.value_head_dim)
+        beta = beta.reshape(batch, actual_seq_len, -1)
+        alpha = alpha.reshape(batch, actual_seq_len, -1)
 
         # Convolution on qkv
         nvtx_range_push(suffix="conv1d")
+        
+        # Get CP-local weights for convolution
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+        ]
+        conv1d_weight = get_parameter_local_cp(
+            self.conv1d.weight,
+            dim=0,
+            cp_group=self.pg_collection.cp,
+            split_sections=qkv_channels_split_sections,
+        )
+        conv1d_bias = (
+            get_parameter_local_cp(
+                self.conv1d.bias,
+                dim=0,
+                cp_group=self.pg_collection.cp,
+                split_sections=qkv_channels_split_sections,
+            )
+            if self.conv_bias
+            else None
+        )
         
         if is_packed:
             # For packed sequences, use FLA's causal_conv1d with native cu_seqlens support
@@ -412,12 +440,11 @@ class GatedDeltaNet(MegatronModule):
             if HAVE_FLA and not self.config.deterministic_mode:
                 # Use FLA's causal_conv1d directly with cu_seqlens support (Triton kernel)
                 # Weight shape: (d, 1, w) -> (d, w)
-                conv1d_weight = rearrange(self.conv1d.weight, "d 1 w -> d w")
-                conv1d_bias = self.conv1d.bias if self.conv_bias else None
+                conv1d_weight_reshaped = rearrange(conv1d_weight, "d 1 w -> d w")
                 
                 qkv, _ = fla_causal_conv1d(
                     x=qkv,
-                    weight=conv1d_weight,
+                    weight=conv1d_weight_reshaped,
                     bias=conv1d_bias,
                     activation=self.activation,
                     cu_seqlens=cu_seqlens,
@@ -425,8 +452,6 @@ class GatedDeltaNet(MegatronModule):
             elif causal_conv1d_fn is not None and not self.config.deterministic_mode:
                 # Fallback to causal_conv1d_fn with seq_idx
                 qkv = qkv.transpose(1, 2)  # (1, seq_len, d) -> (1, d, seq_len)
-                conv1d_weight = self.conv1d.weight
-                conv1d_bias = self.conv1d.bias if self.conv_bias else None
                 
                 assert self.activation in ["silu", "swish"]
                 qkv = causal_conv1d_fn(
@@ -440,35 +465,13 @@ class GatedDeltaNet(MegatronModule):
             else:
                 # Fall back to vectorized conv1d
                 qkv = qkv.transpose(1, 2)  # (1, seq_len, d) -> (1, d, seq_len)
-                conv1d_weight = self.conv1d.weight
-                conv1d_bias = self.conv1d.bias if self.conv_bias else None
                 qkv = self._packed_conv1d_fallback(
                     qkv, conv1d_weight, conv1d_bias, cu_seqlens
                 )
                 qkv = qkv.transpose(1, 2)  # (1, d, seq_len) -> (1, seq_len, d)
         else:
+            # Non-packed path: weights already sliced above
             qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
-            qkv_channels_split_sections = [
-                self.qk_dim_local_tp,
-                self.qk_dim_local_tp,
-                self.v_dim_local_tp,
-            ]
-            conv1d_weight = get_parameter_local_cp(
-                self.conv1d.weight,
-                dim=0,
-                cp_group=self.pg_collection.cp,
-                split_sections=qkv_channels_split_sections,
-            )
-            conv1d_bias = (
-                get_parameter_local_cp(
-                    self.conv1d.bias,
-                    dim=0,
-                    cp_group=self.pg_collection.cp,
-                    split_sections=qkv_channels_split_sections,
-                )
-                if self.conv_bias
-                else None
-            )
             if (causal_conv1d_fn is None) or self.config.deterministic_mode:
                 conv_out = F.conv1d(
                     input=qkv,
@@ -495,32 +498,20 @@ class GatedDeltaNet(MegatronModule):
         # For packed: qkv is already in (b, s, d) format
         if not is_packed:
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-        if is_packed:
-            query, key, value = torch.split(
-                qkv,
-                [
-                    self.qk_dim_local_tp,
-                    self.qk_dim_local_tp,
-                    self.v_dim_local_tp,
-                ],
-                dim=-1,
-            )
-            query = query.reshape(batch, seq_len, -1, self.key_head_dim)
-            key = key.reshape(batch, seq_len, -1, self.key_head_dim)
-            value = value.reshape(batch, seq_len, -1, self.value_head_dim)
-        else:
-            query, key, value = torch.split(
-                qkv,
-                [
-                    self.qk_dim_local_tp // self.cp_size,
-                    self.qk_dim_local_tp // self.cp_size,
-                    self.v_dim_local_tp // self.cp_size,
-                ],
-                dim=-1,
-            )
-            query = query.reshape(batch, seq_len, -1, self.key_head_dim)
-            key = key.reshape(batch, seq_len, -1, self.key_head_dim)
-            value = value.reshape(batch, seq_len, -1, self.value_head_dim)
+        
+        # After all-to-all, the head dimension is sharded by cp_size for both packed and non-packed
+        query, key, value = torch.split(
+            qkv,
+            [
+                self.qk_dim_local_tp // self.cp_size,
+                self.qk_dim_local_tp // self.cp_size,
+                self.v_dim_local_tp // self.cp_size,
+            ],
+            dim=-1,
+        )
+        query = query.reshape(batch, actual_seq_len, -1, self.key_head_dim)
+        key = key.reshape(batch, actual_seq_len, -1, self.key_head_dim)
+        value = value.reshape(batch, actual_seq_len, -1, self.value_head_dim)
             
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
@@ -540,14 +531,11 @@ class GatedDeltaNet(MegatronModule):
 
         # Calculate g and beta
         nvtx_range_push(suffix="g_and_beta")
-        if is_packed:
-            A_log_local_cp = self.A_log
-            dt_bias_local_cp = self.dt_bias
-        else:
-            A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-            dt_bias_local_cp = get_parameter_local_cp(
-                self.dt_bias, dim=0, cp_group=self.pg_collection.cp
-            )
+        # Get CP-local parameters (applies to both packed and non-packed when using CP)
+        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
+        dt_bias_local_cp = get_parameter_local_cp(
+            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
+        )
         g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
         beta = beta.sigmoid()
         nvtx_range_pop(suffix="g_and_beta")
@@ -590,14 +578,14 @@ class GatedDeltaNet(MegatronModule):
 
         # Transpose: b s x --> s b x
         # From bshd back to sbhd format
-        norm_out = norm_out.reshape(batch, seq_len, -1)
+        norm_out = norm_out.reshape(batch, actual_seq_len, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
 
-        # CP all to all: HP to CP (skip for packed sequences)
-        if not is_packed:
-            norm_out = tensor_a2a_hp2cp(
-                norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-            )
+        # CP all to all: HP to CP (scatter sequence back to CP ranks)
+        # This applies to both packed and non-packed sequences when using CP
+        norm_out = tensor_a2a_hp2cp(
+            norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+        )
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
