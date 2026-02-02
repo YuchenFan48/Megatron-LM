@@ -606,9 +606,8 @@ class GatedDeltaNet(MegatronModule):
     ) -> Tensor:
         """
         Fallback conv1d for packed sequences when causal_conv1d_fn is not available.
-        Processes each sequence separately to maintain causality boundaries.
         
-        Uses a simple causal convolution implementation to avoid cuDNN issues.
+        Uses vectorized approach with sequence boundary masking for better performance.
         
         Args:
             qkv: Input tensor of shape (batch=1, d, total_tokens)
@@ -622,46 +621,62 @@ class GatedDeltaNet(MegatronModule):
         batch, d, total_tokens = qkv.shape
         assert batch == 1, "Packed sequences should have batch size 1"
         
-        # Get kernel size from weight shape
         kernel_size = weight.shape[-1]
-        # weight shape: (d, 1, kernel_size) for depthwise conv
-        # Reshape to (d, kernel_size) for manual convolution
         weight_2d = weight.squeeze(1)  # (d, kernel_size)
         
-        output = torch.zeros_like(qkv)
-        num_seqs = cu_seqlens.shape[0] - 1
+        # Create position indices for masking
+        # We need to mask out positions where convolution would cross sequence boundaries
+        positions = torch.arange(total_tokens, device=qkv.device)
         
-        for i in range(num_seqs):
-            start = int(cu_seqlens[i].item())
-            end = int(cu_seqlens[i + 1].item())
-            seq_len = end - start
-            
-            if seq_len == 0:
-                continue
-            
-            # Extract this sequence: (1, d, seq_len)
-            seq_qkv = qkv[:, :, start:end].contiguous()
-            
-            # Manual causal convolution to avoid cuDNN issues
-            # Pad on the left for causal convolution
-            padded = F.pad(seq_qkv, (kernel_size - 1, 0))  # (1, d, seq_len + kernel_size - 1)
-            
-            # Apply depthwise convolution manually using unfold
-            # unfold: (1, d, seq_len + kernel_size - 1) -> (1, d, seq_len, kernel_size)
-            unfolded = padded.unfold(dimension=2, size=kernel_size, step=1)  # (1, d, seq_len, kernel_size)
-            
-            # Depthwise conv: sum over kernel dimension with weights
-            # weight_2d: (d, kernel_size), unfolded: (1, d, seq_len, kernel_size)
-            conv_out = (unfolded * weight_2d.unsqueeze(0).unsqueeze(2)).sum(dim=-1)  # (1, d, seq_len)
-            
-            # Add bias if present
-            if bias is not None:
-                conv_out = conv_out + bias.view(1, -1, 1)
-            
-            # Apply activation
-            conv_out = self.act_fn(conv_out)
-            output[:, :, start:end] = conv_out
-            
+        # Find which sequence each position belongs to using searchsorted
+        # seq_ids[i] = sequence index for position i
+        # searchsorted returns the index where position would be inserted in cu_seqlens
+        # We subtract 1 and clamp to get the sequence index
+        seq_ids = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+        seq_ids = seq_ids.clamp(max=cu_seqlens.shape[0] - 2)
+        
+        # Get sequence starts for each position
+        seq_starts = cu_seqlens[:-1].long()
+        
+        # For each position, compute the distance to the start of its sequence
+        # This tells us how many valid positions we can look back
+        pos_in_seq = positions - seq_starts[seq_ids]  # (total_tokens,)
+        
+        # Pad input for causal convolution
+        padded = F.pad(qkv, (kernel_size - 1, 0))  # (1, d, total_tokens + kernel_size - 1)
+        
+        # Unfold to get sliding windows
+        # Shape: (1, d, total_tokens, kernel_size)
+        unfolded = padded.unfold(dimension=2, size=kernel_size, step=1)
+        
+        # Create causal mask that respects sequence boundaries
+        # For position i, we can only look back min(kernel_size, pos_in_seq[i] + 1) positions
+        # Create mask: (total_tokens, kernel_size)
+        kernel_positions = torch.arange(kernel_size, device=qkv.device)  # [0, 1, ..., k-1]
+        # Distance from current position: kernel_size - 1 - kernel_positions gives [k-1, k-2, ..., 0]
+        # i.e., how far back each kernel position looks
+        lookback = kernel_size - 1 - kernel_positions  # (kernel_size,)
+        
+        # Valid if lookback <= pos_in_seq (we have enough history within the sequence)
+        # mask[i, j] = 1 if position i can use kernel position j
+        mask = (lookback.unsqueeze(0) <= pos_in_seq.unsqueeze(1)).float()  # (total_tokens, kernel_size)
+        
+        # Apply mask to unfolded tensor
+        # unfolded: (1, d, total_tokens, kernel_size)
+        # mask: (total_tokens, kernel_size) -> (1, 1, total_tokens, kernel_size)
+        masked_unfolded = unfolded * mask.unsqueeze(0).unsqueeze(0)
+        
+        # Apply convolution weights
+        # weight_2d: (d, kernel_size) -> (1, d, 1, kernel_size)
+        conv_out = (masked_unfolded * weight_2d.unsqueeze(0).unsqueeze(2)).sum(dim=-1)  # (1, d, total_tokens)
+        
+        # Add bias
+        if bias is not None:
+            conv_out = conv_out + bias.view(1, -1, 1)
+        
+        # Apply activation
+        output = self.act_fn(conv_out)
+        
         return output
 
     def _packed_gated_delta_rule(
