@@ -272,6 +272,14 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = None
     """Number of value and gate heads for the gated delta net."""
 
+    gated_delta_net_cp_mode: str = "sequence_parallel"
+    """Context parallel mode for gated delta net. Options:
+    - "head_parallel": All-to-all based, each rank processes FULL sequence with partial heads.
+        Memory: O(seq_len * hidden/cp_size). Does NOT reduce sequence memory. Good for many heads.
+    - "sequence_parallel" (default): Ring-style, each rank processes PARTIAL sequence with full heads.
+        Memory: O(seq_len/cp_size * hidden). Truly reduces sequence memory. Good for long sequences.
+    Note: For very long sequences (128K+), use "sequence_parallel" to reduce memory usage."""
+
     ####################
     # attention variant: dsa
     ####################
@@ -924,16 +932,37 @@ class TransformerConfig(ModelParallelConfig):
                     f"linear_num_key_heads ({self.linear_num_key_heads})."
                 )
 
+                # Validate cp_mode
+                assert self.gated_delta_net_cp_mode in ["head_parallel", "sequence_parallel"], (
+                    f"gated_delta_net_cp_mode must be 'head_parallel' or 'sequence_parallel', "
+                    f"got {self.gated_delta_net_cp_mode}"
+                )
+
                 # Check tensor parallelism and context parallelism compatibility
-                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
-                assert self.linear_num_key_heads % tp_cp_size == 0, (
-                    f"{self.linear_num_key_heads=} must be a multiple of "
-                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
-                )
-                assert self.linear_num_value_heads % tp_cp_size == 0, (
-                    f"{self.linear_num_value_heads=} must be a multiple of "
-                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
-                )
+                # For SEQUENCE_PARALLEL mode: heads only need to be divisible by TP size
+                # For HEAD_PARALLEL mode: heads need to be divisible by TP * CP size
+                if self.gated_delta_net_cp_mode == "head_parallel":
+                    tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+                    assert self.linear_num_key_heads % tp_cp_size == 0, (
+                        f"{self.linear_num_key_heads=} must be a multiple of "
+                        f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=}) "
+                        f"when using head_parallel CP mode."
+                    )
+                    assert self.linear_num_value_heads % tp_cp_size == 0, (
+                        f"{self.linear_num_value_heads=} must be a multiple of "
+                        f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=}) "
+                        f"when using head_parallel CP mode."
+                    )
+                else:  # sequence_parallel
+                    # Only need TP divisibility for sequence parallel mode
+                    assert self.linear_num_key_heads % self.tensor_model_parallel_size == 0, (
+                        f"{self.linear_num_key_heads=} must be a multiple of "
+                        f"{self.tensor_model_parallel_size=} when using sequence_parallel CP mode."
+                    )
+                    assert self.linear_num_value_heads % self.tensor_model_parallel_size == 0, (
+                        f"{self.linear_num_value_heads=} must be a multiple of "
+                        f"{self.tensor_model_parallel_size=} when using sequence_parallel CP mode."
+                    )
         elif self.experimental_attention_variant == "dsa":
             assert (
                 self.context_parallel_size == 1

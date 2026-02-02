@@ -3373,6 +3373,14 @@ def _add_experimental_attention_variant_args(parser):
                        help='Number of query and key heads for the gated delta net.')
     group.add_argument('--linear-num-value-heads', default=32, type=int,
                        help='Number of value and gate heads for the gated delta net.')
+    group.add_argument('--gated-delta-net-cp-mode', default='sequence_parallel', 
+                       choices=['head_parallel', 'sequence_parallel'], type=str,
+                       help='Context parallel mode for gated delta net. Options: '
+                            '"head_parallel" - All-to-all based, each rank processes FULL sequence with partial heads. '
+                            'Memory: O(seq_len * hidden/cp_size). Does NOT reduce sequence memory. '
+                            '"sequence_parallel" (default) - Ring-style, each rank processes PARTIAL sequence with full heads. '
+                            'Memory: O(seq_len/cp_size * hidden). Truly reduces sequence memory. '
+                            'Use "sequence_parallel" for very long sequences (128K+).')
 
     # DSA
     group.add_argument('--dsa-indexer-n-heads', default=None, type=int,

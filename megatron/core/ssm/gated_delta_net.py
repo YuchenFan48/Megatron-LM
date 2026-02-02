@@ -7,6 +7,7 @@
 
 import logging
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -38,6 +39,22 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+
+
+class GatedDeltaNetCPMode(str, Enum):
+    """Context Parallel mode for GatedDeltaNet.
+    
+    HEAD_PARALLEL (default): All-to-all based, each rank processes full sequence with partial heads.
+        - Memory usage: O(seq_len * hidden/cp_size)
+        - Suitable for: shorter sequences with many heads
+        
+    SEQUENCE_PARALLEL: Ring-style, each rank processes partial sequence with full heads.
+        - Memory usage: O(seq_len/cp_size * hidden)  
+        - Suitable for: very long sequences (128K+)
+        - Note: Requires sequential state passing between CP ranks
+    """
+    HEAD_PARALLEL = "head_parallel"
+    SEQUENCE_PARALLEL = "sequence_parallel"
 
 import sys
 import os
@@ -110,6 +127,10 @@ class GatedDeltaNet(MegatronModule):
 
     GDN layer takes input with size [s, b, h]
     and returns output of the same size.
+    
+    Supports two Context Parallel modes:
+    - HEAD_PARALLEL (default): All-to-all based, each rank has full sequence, partial heads
+    - SEQUENCE_PARALLEL: Ring-style, each rank has partial sequence, full heads (for long sequences)
     """
 
     def __init__(
@@ -123,6 +144,7 @@ class GatedDeltaNet(MegatronModule):
         use_qk_l2norm: bool = True,
         A_init_range: Tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
+        cp_mode: Union[str, GatedDeltaNetCPMode, None] = None,
         **kwargs,
     ):
         """
@@ -137,6 +159,13 @@ class GatedDeltaNet(MegatronModule):
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
+            cp_mode: Context parallel mode. If None, reads from config.gated_delta_net_cp_mode. Options:
+                - "head_parallel" or GatedDeltaNetCPMode.HEAD_PARALLEL: 
+                    Each CP rank processes full sequence with partial heads.
+                    Memory: O(seq_len * hidden/cp_size). Good for many heads.
+                - "sequence_parallel" or GatedDeltaNetCPMode.SEQUENCE_PARALLEL (default):
+                    Each CP rank processes partial sequence with full heads.
+                    Memory: O(seq_len/cp_size * hidden). Good for very long sequences (128K+).
         """
 
         if not HAVE_FLA:
@@ -157,8 +186,23 @@ class GatedDeltaNet(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
         self.pg_collection = pg_collection
         self.cp_size = self.pg_collection.cp.size()
+        self.cp_rank = self.pg_collection.cp.rank()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
+        
+        # Parse and validate CP mode (read from config if not provided)
+        if cp_mode is None:
+            cp_mode = getattr(config, 'gated_delta_net_cp_mode', 'sequence_parallel')
+        if isinstance(cp_mode, str):
+            cp_mode = GatedDeltaNetCPMode(cp_mode)
+        self.cp_mode = cp_mode
+        
+        if self.cp_mode == GatedDeltaNetCPMode.SEQUENCE_PARALLEL and self.cp_size > 1:
+            logger.info(
+                f"GatedDeltaNet layer {layer_number}: Using SEQUENCE_PARALLEL mode for CP. "
+                f"Each rank processes seq_len/{self.cp_size} tokens with all heads. "
+                f"This is optimal for very long sequences."
+            )
 
         # Attributes from config
         self.config = config
@@ -317,6 +361,271 @@ class GatedDeltaNet(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        if inference_context is not None:
+            assert (
+                inference_context.is_static_batching()
+            ), "GDN does not currently support dynamic inference batching."
+            assert not self.config.sequence_parallel
+            # TODO: support inference
+            raise NotImplementedError("GDN does not support inference for now.")
+
+        # Route to appropriate CP mode implementation
+        if self.cp_size > 1 and self.cp_mode == GatedDeltaNetCPMode.SEQUENCE_PARALLEL:
+            return self._forward_sequence_parallel(
+                hidden_states, attention_mask, packed_seq_params
+            )
+        else:
+            return self._forward_head_parallel(
+                hidden_states, attention_mask, packed_seq_params
+            )
+
+    def _forward_sequence_parallel(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """
+        Forward pass using SEQUENCE_PARALLEL mode for CP.
+        
+        Each CP rank processes a chunk of the sequence with ALL heads.
+        Recurrent state is passed between CP ranks using P2P communication.
+        
+        Memory usage: O(seq_len/cp_size * hidden)
+        This is optimal for very long sequences.
+        """
+        # Check if using packed sequences (THD format) - not supported in sequence parallel mode
+        is_packed = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        if is_packed:
+            raise NotImplementedError(
+                "SEQUENCE_PARALLEL CP mode does not support packed sequences (THD format). "
+                "Please use HEAD_PARALLEL mode for packed sequences."
+            )
+        
+        local_seq_len, batch, _ = hidden_states.shape
+        local_seq_len = local_seq_len * self.sp_size  # Account for sequence parallel
+        
+        # Input projection (full hidden dimension, no head sharding)
+        nvtx_range_push(suffix="in_proj")
+        qkvzba, _ = self.in_proj(hidden_states)
+        nvtx_range_pop(suffix="in_proj")
+        
+        # In sequence parallel mode, we don't do all-to-all
+        # Each rank processes its local sequence chunk with full heads
+        
+        # Transpose: s b x --> b s x
+        qkvzba = qkvzba.transpose(0, 1)
+        
+        # Split into q, k, v, gate, beta, alpha (no CP sharding on heads)
+        qkv, gate, beta, alpha = torch.split(
+            qkvzba,
+            [
+                self.qk_dim_local_tp * 2 + self.v_dim_local_tp,
+                self.v_dim_local_tp,
+                self.num_value_heads // self.tp_size,
+                self.num_value_heads // self.tp_size,
+            ],
+            dim=-1,
+        )
+        
+        gate = gate.reshape(batch, local_seq_len, -1, self.value_head_dim)
+        beta = beta.reshape(batch, local_seq_len, -1)
+        alpha = alpha.reshape(batch, local_seq_len, -1)
+        
+        # Convolution on qkv (using full weights, no CP slicing)
+        nvtx_range_push(suffix="conv1d")
+        
+        # For sequence parallel, we need to handle convolution at sequence boundaries
+        # This requires receiving the last (kernel_size-1) tokens from previous CP rank
+        qkv = self._sequence_parallel_conv1d(qkv, batch, local_seq_len)
+        
+        nvtx_range_pop(suffix="conv1d")
+        
+        # Split qkv into query, key, value (full heads)
+        query, key, value = torch.split(
+            qkv,
+            [
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+            ],
+            dim=-1,
+        )
+        query = query.reshape(batch, local_seq_len, -1, self.key_head_dim)
+        key = key.reshape(batch, local_seq_len, -1, self.key_head_dim)
+        value = value.reshape(batch, local_seq_len, -1, self.value_head_dim)
+        
+        # Apply L2 norm to query and key
+        if self.use_qk_l2norm:
+            query = l2norm(query.contiguous())
+            key = l2norm(key.contiguous())
+        if self.num_value_heads // self.num_key_heads > 1:
+            query = query.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
+            key = key.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
+        
+        # Make contiguous
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        gate = gate.contiguous()
+        beta = beta.contiguous()
+        alpha = alpha.contiguous()
+        
+        # Calculate g and beta (using full parameters, no CP slicing)
+        nvtx_range_push(suffix="g_and_beta")
+        g = -self.A_log.exp() * F.softplus(alpha.float() + self.dt_bias)  # In fp32
+        beta = beta.sigmoid()
+        nvtx_range_pop(suffix="g_and_beta")
+        
+        # Get initial state from previous CP rank (if not first rank)
+        nvtx_range_push(suffix="gated_delta_rule")
+        initial_state = self._receive_state_from_prev_rank(batch)
+        
+        # Compute gated delta rule with state passing
+        if self.config.deterministic_mode:
+            core_attn_out, final_state = torch_chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=(self.cp_rank < self.cp_size - 1),  # Output state if not last rank
+                use_qk_l2norm_in_kernel=False,
+            )
+        else:
+            core_attn_out, final_state = chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=(self.cp_rank < self.cp_size - 1),
+                use_qk_l2norm_in_kernel=False,
+            )
+        
+        # Send final state to next CP rank (if not last rank)
+        self._send_state_to_next_rank(final_state)
+        nvtx_range_pop(suffix="gated_delta_rule")
+        
+        # RMSNorm
+        nvtx_range_push(suffix="gated_norm")
+        norm_out = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix="gated_norm")
+        
+        # Transpose: b s x --> s b x
+        norm_out = norm_out.reshape(batch, local_seq_len, -1)
+        norm_out = norm_out.transpose(0, 1).contiguous()
+        
+        # Output projection
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+        
+        return out, out_bias
+    
+    def _sequence_parallel_conv1d(
+        self,
+        qkv: Tensor,
+        batch: int,
+        local_seq_len: int,
+    ) -> Tensor:
+        """
+        Perform causal conv1d for sequence parallel mode.
+        
+        Handles sequence boundary by receiving context from previous CP rank.
+        """
+        # qkv: (batch, local_seq_len, conv_dim)
+        kernel_size = self.conv_kernel_dim
+        
+        if self.cp_rank > 0:
+            # Receive context (last kernel_size-1 tokens) from previous rank
+            context_size = kernel_size - 1
+            context = torch.empty(
+                batch, context_size, self.conv_dim_local_tp,
+                dtype=qkv.dtype, device=qkv.device
+            )
+            torch.distributed.recv(context, src=self.cp_rank - 1, group=self.pg_collection.cp)
+            # Prepend context to qkv
+            qkv_with_context = torch.cat([context, qkv], dim=1)
+        else:
+            # First rank: pad with zeros
+            qkv_with_context = F.pad(qkv, (0, 0, kernel_size - 1, 0))
+        
+        # Send last (kernel_size-1) tokens to next rank (async)
+        if self.cp_rank < self.cp_size - 1:
+            send_buffer = qkv[:, -(kernel_size - 1):, :].contiguous()
+            torch.distributed.send(send_buffer, dst=self.cp_rank + 1, group=self.pg_collection.cp)
+        
+        # Perform conv1d
+        qkv_with_context = qkv_with_context.transpose(1, 2).contiguous()  # (b, d, s+pad)
+        
+        if (causal_conv1d_fn is None) or self.config.deterministic_mode:
+            conv_out = F.conv1d(
+                input=qkv_with_context,
+                weight=self.conv1d.weight,
+                bias=self.conv1d.bias if self.conv_bias else None,
+                stride=self.conv1d.stride,
+                padding=0,  # We already handled padding
+                dilation=self.conv1d.dilation,
+                groups=self.conv_dim_local_tp,
+            )
+            qkv_out = self.act_fn(conv_out)
+        else:
+            # Use causal_conv1d_fn - it expects (b, d, s) and handles causal masking internally
+            # We still need the context prepended for correct results
+            qkv_out = causal_conv1d_fn(
+                x=qkv_with_context,
+                weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias if self.conv_bias else None,
+                activation=self.activation,
+            )
+        
+        # Take only the valid output (remove context positions from output)
+        if self.cp_rank > 0:
+            qkv_out = qkv_out[:, :, (kernel_size - 1):]
+        
+        qkv_out = qkv_out.transpose(1, 2)  # (b, s, d)
+        return qkv_out
+    
+    def _receive_state_from_prev_rank(self, batch: int) -> Optional[Tensor]:
+        """Receive recurrent state from previous CP rank."""
+        if self.cp_rank == 0:
+            return None
+        
+        # State shape: (batch, num_heads, key_dim, value_dim)
+        num_heads = self.num_value_heads // self.tp_size
+        state = torch.empty(
+            batch, num_heads, self.key_head_dim, self.value_head_dim,
+            dtype=torch.float32,  # State is in fp32
+            device=torch.cuda.current_device(),
+        )
+        torch.distributed.recv(state, src=self.cp_rank - 1, group=self.pg_collection.cp)
+        return state
+    
+    def _send_state_to_next_rank(self, state: Optional[Tensor]):
+        """Send recurrent state to next CP rank."""
+        if self.cp_rank >= self.cp_size - 1 or state is None:
+            return
+        
+        # State should already be in fp32
+        torch.distributed.send(state.contiguous(), dst=self.cp_rank + 1, group=self.pg_collection.cp)
+
+    def _forward_head_parallel(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """
+        Forward pass using HEAD_PARALLEL mode for CP (original implementation).
+        
+        All-to-all based: each CP rank processes full sequence with partial heads.
+        
+        Memory usage: O(seq_len * hidden/cp_size)
+        Note: Sequence length is NOT reduced, only head dimension is sharded.
+        """
         # Check if using packed sequences (THD format)
         is_packed = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
 
@@ -339,14 +648,6 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens = None
             cu_seqlens_global = None
             seq_idx = None
-
-        if inference_context is not None:
-            assert (
-                inference_context.is_static_batching()
-            ), "GDN does not currently support dynamic inference batching."
-            assert not self.config.sequence_parallel
-            # TODO: support inference
-            raise NotImplementedError("GDN does not support inference for now.")
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
