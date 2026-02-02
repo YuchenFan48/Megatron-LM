@@ -547,6 +547,9 @@ class GatedDeltaNet(MegatronModule):
         Perform causal conv1d for sequence parallel mode.
         
         Handles sequence boundary by receiving context from previous CP rank.
+        
+        Note: We always use F.conv1d here (not causal_conv1d_fn) because we need
+        explicit control over the padding/context at sequence boundaries.
         """
         # qkv: (batch, local_seq_len, conv_dim)
         kernel_size = self.conv_kernel_dim
@@ -562,43 +565,32 @@ class GatedDeltaNet(MegatronModule):
             # Prepend context to qkv
             qkv_with_context = torch.cat([context, qkv], dim=1)
         else:
-            # First rank: pad with zeros
+            # First rank: pad with zeros (causal: no future context)
             qkv_with_context = F.pad(qkv, (0, 0, kernel_size - 1, 0))
         
-        # Send last (kernel_size-1) tokens to next rank (async)
+        # Send last (kernel_size-1) tokens to next rank
         if self.cp_rank < self.cp_size - 1:
             send_buffer = qkv[:, -(kernel_size - 1):, :].contiguous()
             torch.distributed.send(send_buffer, dst=self.cp_rank + 1, group=self.pg_collection.cp)
         
-        # Perform conv1d
+        # Perform conv1d with explicit padding control
+        # Input shape: (b, local_seq_len + kernel_size - 1, d)
         qkv_with_context = qkv_with_context.transpose(1, 2).contiguous()  # (b, d, s+pad)
         
-        if (causal_conv1d_fn is None) or self.config.deterministic_mode:
-            conv_out = F.conv1d(
-                input=qkv_with_context,
-                weight=self.conv1d.weight,
-                bias=self.conv1d.bias if self.conv_bias else None,
-                stride=self.conv1d.stride,
-                padding=0,  # We already handled padding
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp,
-            )
-            qkv_out = self.act_fn(conv_out)
-        else:
-            # Use causal_conv1d_fn - it expects (b, d, s) and handles causal masking internally
-            # We still need the context prepended for correct results
-            qkv_out = causal_conv1d_fn(
-                x=qkv_with_context,
-                weight=self.conv1d.weight.squeeze(1),
-                bias=self.conv1d.bias if self.conv_bias else None,
-                activation=self.activation,
-            )
+        # Always use F.conv1d for explicit control over sequence boundaries
+        conv_out = F.conv1d(
+            input=qkv_with_context,
+            weight=self.conv1d.weight,
+            bias=self.conv1d.bias if self.conv_bias else None,
+            stride=self.conv1d.stride,
+            padding=0,  # We already handled padding manually
+            dilation=self.conv1d.dilation,
+            groups=self.conv_dim_local_tp,
+        )
+        # conv_out shape: (b, d, local_seq_len) - F.conv1d with padding=0 reduces length
+        qkv_out = self.act_fn(conv_out)
         
-        # Take only the valid output (remove context positions from output)
-        if self.cp_rank > 0:
-            qkv_out = qkv_out[:, :, (kernel_size - 1):]
-        
-        qkv_out = qkv_out.transpose(1, 2)  # (b, s, d)
+        qkv_out = qkv_out.transpose(1, 2)  # (b, local_seq_len, d)
         return qkv_out
     
     def _receive_state_from_prev_rank(self, batch: int) -> Optional[Tensor]:
