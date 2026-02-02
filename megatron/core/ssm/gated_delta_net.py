@@ -608,6 +608,8 @@ class GatedDeltaNet(MegatronModule):
         Fallback conv1d for packed sequences when causal_conv1d_fn is not available.
         Processes each sequence separately to maintain causality boundaries.
         
+        Uses a simple causal convolution implementation to avoid cuDNN issues.
+        
         Args:
             qkv: Input tensor of shape (batch=1, d, total_tokens)
             weight: Conv1d weight of shape (d, 1, kernel_size)
@@ -620,30 +622,44 @@ class GatedDeltaNet(MegatronModule):
         batch, d, total_tokens = qkv.shape
         assert batch == 1, "Packed sequences should have batch size 1"
         
+        # Get kernel size from weight shape
+        kernel_size = weight.shape[-1]
+        # weight shape: (d, 1, kernel_size) for depthwise conv
+        # Reshape to (d, kernel_size) for manual convolution
+        weight_2d = weight.squeeze(1)  # (d, kernel_size)
+        
         output = torch.zeros_like(qkv)
         num_seqs = cu_seqlens.shape[0] - 1
         
         for i in range(num_seqs):
-            start = cu_seqlens[i].item()
-            end = cu_seqlens[i + 1].item()
+            start = int(cu_seqlens[i].item())
+            end = int(cu_seqlens[i + 1].item())
             seq_len = end - start
             
-            # Extract this sequence
-            seq_qkv = qkv[:, :, start:end]  # (1, d, seq_len)
+            if seq_len == 0:
+                continue
             
-            # Apply conv1d with proper padding
-            conv_out = F.conv1d(
-                input=seq_qkv,
-                weight=weight,
-                bias=bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp,
-            )
+            # Extract this sequence: (1, d, seq_len)
+            seq_qkv = qkv[:, :, start:end].contiguous()
             
-            # Apply activation and truncate to original length
-            conv_out = self.act_fn(conv_out[..., :seq_len])
+            # Manual causal convolution to avoid cuDNN issues
+            # Pad on the left for causal convolution
+            padded = F.pad(seq_qkv, (kernel_size - 1, 0))  # (1, d, seq_len + kernel_size - 1)
+            
+            # Apply depthwise convolution manually using unfold
+            # unfold: (1, d, seq_len + kernel_size - 1) -> (1, d, seq_len, kernel_size)
+            unfolded = padded.unfold(dimension=2, size=kernel_size, step=1)  # (1, d, seq_len, kernel_size)
+            
+            # Depthwise conv: sum over kernel dimension with weights
+            # weight_2d: (d, kernel_size), unfolded: (1, d, seq_len, kernel_size)
+            conv_out = (unfolded * weight_2d.unsqueeze(0).unsqueeze(2)).sum(dim=-1)  # (1, d, seq_len)
+            
+            # Add bias if present
+            if bias is not None:
+                conv_out = conv_out + bias.view(1, -1, 1)
+            
+            # Apply activation
+            conv_out = self.act_fn(conv_out)
             output[:, :, start:end] = conv_out
             
         return output
