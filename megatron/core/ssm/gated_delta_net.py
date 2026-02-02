@@ -48,16 +48,10 @@ from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 HAVE_FLA = True
 
-    HAVE_FLA = False
 
-# Try to import FLA's ShortConvolution which has native cu_seqlens support
-try:
-    from fla.modules import ShortConvolution as FLAShortConvolution
+from fla.modules import ShortConvolution as FLAShortConvolution
 
-    HAVE_FLA_SHORT_CONV = True
-except ImportError:
-    FLAShortConvolution = None
-    HAVE_FLA_SHORT_CONV = False
+HAVE_FLA_SHORT_CONV = True
 
 try:
     from causal_conv1d import causal_conv1d_fn
