@@ -48,11 +48,6 @@ from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 HAVE_FLA = True
 
-
-from fla.modules import ShortConvolution as FLAShortConvolution
-
-HAVE_FLA_SHORT_CONV = True
-
 try:
     from causal_conv1d import causal_conv1d_fn
 except ImportError:
@@ -407,28 +402,11 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_push(suffix="conv1d")
         
         if is_packed:
-            # For packed sequences, try to use FLA's ShortConvolution first (best performance)
+            # For packed sequences, use causal_conv1d_fn with seq_idx for best performance
             # Input qkv is in (batch=1, seq_len, d) format
             
-            if HAVE_FLA_SHORT_CONV and not self.config.deterministic_mode:
-                # Use FLA's ShortConvolution with native cu_seqlens support
-                # Create ShortConvolution lazily if not exists
-                if not hasattr(self, '_fla_short_conv') or self._fla_short_conv is None:
-                    self._fla_short_conv = FLAShortConvolution(
-                        hidden_size=self.conv_dim_local_tp,
-                        kernel_size=self.conv_kernel_dim,
-                        activation=self.activation,
-                    ).to(qkv.device, qkv.dtype)
-                    # Copy weights from our conv1d
-                    with torch.no_grad():
-                        # FLA ShortConvolution weight shape: (hidden_size, kernel_size)
-                        # Our conv1d weight shape: (hidden_size, 1, kernel_size)
-                        self._fla_short_conv.weight.copy_(self.conv1d.weight.squeeze(1))
-                
-                # FLA ShortConvolution expects (batch, seq_len, hidden_size) format
-                qkv, _ = self._fla_short_conv(x=qkv, cu_seqlens=cu_seqlens)
-            elif causal_conv1d_fn is not None and not self.config.deterministic_mode:
-                # Fallback to causal_conv1d_fn with seq_idx
+            if causal_conv1d_fn is not None and not self.config.deterministic_mode:
+                # Use causal_conv1d_fn with seq_idx for proper sequence boundary handling
                 qkv = qkv.transpose(1, 2)  # (1, seq_len, d) -> (1, d, seq_len)
                 conv1d_weight = self.conv1d.weight
                 conv1d_bias = self.conv1d.bias if self.conv_bias else None
