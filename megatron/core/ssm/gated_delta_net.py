@@ -40,6 +40,8 @@ from megatron.core.transformer.utils import (
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 import sys
+import os
+ 
 if not os.path.exists('/apdcephfs/mnt/cephfs/users/yuchenfan/flash-linear-attention'):
     raise ImportError("Hard code the path to flash-linear-attention in the code -> gated_delta_net.py")
 sys.path.append('/apdcephfs/mnt/cephfs/users/yuchenfan/flash-linear-attention')
