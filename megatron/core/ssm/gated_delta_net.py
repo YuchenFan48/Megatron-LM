@@ -413,25 +413,32 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_push(suffix="conv1d")
         
         if is_packed:
-            # For packed sequences, use channels-last layout for seq_idx support
-            # qkv shape: (batch=1, seq_len, d) -> (batch=1, d, seq_len) but transposed for seq_idx
-            qkv = qkv.transpose(1, 2)  # (1, seq_len, d) -> (1, d, seq_len)
+            # For packed sequences, try to use FLA's ShortConvolution first (best performance)
+            # Input qkv is in (batch=1, seq_len, d) format
             
-            qkv_channels_split_sections = [
-                self.qk_dim_local_tp,
-                self.qk_dim_local_tp,
-                self.v_dim_local_tp,
-            ]
-            conv1d_weight = self.conv1d.weight
-            conv1d_bias = self.conv1d.bias if self.conv_bias else None
-            
-            if (causal_conv1d_fn is None) or self.config.deterministic_mode:
-                # Fall back to standard conv1d without seq_idx
-                # Need to process each sequence separately for correctness
-                qkv = self._packed_conv1d_fallback(
-                    qkv, conv1d_weight, conv1d_bias, cu_seqlens
-                )
-            else:
+            if HAVE_FLA_SHORT_CONV and not self.config.deterministic_mode:
+                # Use FLA's ShortConvolution with native cu_seqlens support
+                # Create ShortConvolution lazily if not exists
+                if not hasattr(self, '_fla_short_conv') or self._fla_short_conv is None:
+                    self._fla_short_conv = FLAShortConvolution(
+                        hidden_size=self.conv_dim_local_tp,
+                        kernel_size=self.conv_kernel_dim,
+                        activation=self.activation,
+                    ).to(qkv.device, qkv.dtype)
+                    # Copy weights from our conv1d
+                    with torch.no_grad():
+                        # FLA ShortConvolution weight shape: (hidden_size, kernel_size)
+                        # Our conv1d weight shape: (hidden_size, 1, kernel_size)
+                        self._fla_short_conv.weight.copy_(self.conv1d.weight.squeeze(1))
+                
+                # FLA ShortConvolution expects (batch, seq_len, hidden_size) format
+                qkv, _ = self._fla_short_conv(x=qkv, cu_seqlens=cu_seqlens)
+            elif causal_conv1d_fn is not None and not self.config.deterministic_mode:
+                # Fallback to causal_conv1d_fn with seq_idx
+                qkv = qkv.transpose(1, 2)  # (1, seq_len, d) -> (1, d, seq_len)
+                conv1d_weight = self.conv1d.weight
+                conv1d_bias = self.conv1d.bias if self.conv_bias else None
+                
                 assert self.activation in ["silu", "swish"]
                 qkv = causal_conv1d_fn(
                     x=qkv,
@@ -440,6 +447,16 @@ class GatedDeltaNet(MegatronModule):
                     activation=self.activation,
                     seq_idx=seq_idx,
                 )
+                qkv = qkv.transpose(1, 2)  # (1, d, seq_len) -> (1, seq_len, d)
+            else:
+                # Fall back to vectorized conv1d
+                qkv = qkv.transpose(1, 2)  # (1, seq_len, d) -> (1, d, seq_len)
+                conv1d_weight = self.conv1d.weight
+                conv1d_bias = self.conv1d.bias if self.conv_bias else None
+                qkv = self._packed_conv1d_fallback(
+                    qkv, conv1d_weight, conv1d_bias, cu_seqlens
+                )
+                qkv = qkv.transpose(1, 2)  # (1, d, seq_len) -> (1, seq_len, d)
         else:
             qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
             qkv_channels_split_sections = [
@@ -485,7 +502,10 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="conv1d")
         
         # Split qkv into query, key, and value
-        qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+        # For non-packed: qkv is in (b, d, s), need to transpose to (b, s, d)
+        # For packed: qkv is already in (b, s, d) format
+        if not is_packed:
+            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         if is_packed:
             query, key, value = torch.split(
                 qkv,
