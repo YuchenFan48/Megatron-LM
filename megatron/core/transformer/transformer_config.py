@@ -280,6 +280,14 @@ class TransformerConfig(ModelParallelConfig):
         Memory: O(seq_len/cp_size * hidden). Truly reduces sequence memory. Good for long sequences.
     Note: For very long sequences (128K+), use "sequence_parallel" to reduce memory usage."""
 
+    kda_cp_mode: str = "sequence_parallel"
+    """Context parallel mode for KDA (Kimi Delta Attention). Options:
+    - "head_parallel": All-to-all based, each rank processes FULL sequence with partial heads.
+        Memory: O(seq_len * hidden/cp_size). Does NOT reduce sequence memory. Good for many heads.
+    - "sequence_parallel" (default): Ring-style, each rank processes PARTIAL sequence with full heads.
+        Memory: O(seq_len/cp_size * hidden). Truly reduces sequence memory. Good for long sequences.
+    Note: For very long sequences (128K+), use "sequence_parallel" to reduce memory usage."""
+
     ####################
     # attention variant: dsa
     ####################
@@ -905,64 +913,69 @@ class TransformerConfig(ModelParallelConfig):
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
 
-        if self.experimental_attention_variant in ["gated_delta_net"]:
+        if self.experimental_attention_variant in ["gated_delta_net", "kda"]:
             assert (
                 self.linear_attention_freq is not None
             ), f"linear_attention_freq must be set for linear attention."
 
+            # Common linear attention parameters validation
+            assert (
+                self.linear_conv_kernel_dim is not None
+            ), f"linear_conv_kernel_dim must be set for {self.experimental_attention_variant}."
+            assert (
+                self.linear_key_head_dim is not None
+            ), f"linear_key_head_dim must be set for {self.experimental_attention_variant}."
+            assert (
+                self.linear_value_head_dim is not None
+            ), f"linear_value_head_dim must be set for {self.experimental_attention_variant}."
+            assert (
+                self.linear_num_key_heads is not None
+            ), f"linear_num_key_heads must be set for {self.experimental_attention_variant}."
+            assert (
+                self.linear_num_value_heads is not None
+            ), f"linear_num_value_heads must be set for {self.experimental_attention_variant}."
+            assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
+                f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
+                f"linear_num_key_heads ({self.linear_num_key_heads})."
+            )
+
+            # Get the appropriate cp_mode based on attention variant
             if self.experimental_attention_variant == "gated_delta_net":
-                # Check required parameters
-                assert (
-                    self.linear_conv_kernel_dim is not None
-                ), "linear_conv_kernel_dim must be set for gated delta net."
-                assert (
-                    self.linear_key_head_dim is not None
-                ), "linear_key_head_dim must be set for gated delta net."
-                assert (
-                    self.linear_value_head_dim is not None
-                ), "linear_value_head_dim must be set for gated delta net."
-                assert (
-                    self.linear_num_key_heads is not None
-                ), "linear_num_key_heads must be set for gated delta net."
-                assert (
-                    self.linear_num_value_heads is not None
-                ), "linear_num_value_heads must be set for gated delta net."
-                assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
-                    f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
-                    f"linear_num_key_heads ({self.linear_num_key_heads})."
-                )
+                cp_mode = self.gated_delta_net_cp_mode
+            else:  # kda
+                cp_mode = self.kda_cp_mode
 
-                # Validate cp_mode
-                assert self.gated_delta_net_cp_mode in ["head_parallel", "sequence_parallel"], (
-                    f"gated_delta_net_cp_mode must be 'head_parallel' or 'sequence_parallel', "
-                    f"got {self.gated_delta_net_cp_mode}"
-                )
+            # Validate cp_mode
+            assert cp_mode in ["head_parallel", "sequence_parallel"], (
+                f"{self.experimental_attention_variant}_cp_mode must be 'head_parallel' or 'sequence_parallel', "
+                f"got {cp_mode}"
+            )
 
-                # Check tensor parallelism and context parallelism compatibility
-                # For SEQUENCE_PARALLEL mode: heads only need to be divisible by TP size
-                # For HEAD_PARALLEL mode: heads need to be divisible by TP * CP size
-                if self.gated_delta_net_cp_mode == "head_parallel":
-                    tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
-                    assert self.linear_num_key_heads % tp_cp_size == 0, (
-                        f"{self.linear_num_key_heads=} must be a multiple of "
-                        f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=}) "
-                        f"when using head_parallel CP mode."
-                    )
-                    assert self.linear_num_value_heads % tp_cp_size == 0, (
-                        f"{self.linear_num_value_heads=} must be a multiple of "
-                        f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=}) "
-                        f"when using head_parallel CP mode."
-                    )
-                else:  # sequence_parallel
-                    # Only need TP divisibility for sequence parallel mode
-                    assert self.linear_num_key_heads % self.tensor_model_parallel_size == 0, (
-                        f"{self.linear_num_key_heads=} must be a multiple of "
-                        f"{self.tensor_model_parallel_size=} when using sequence_parallel CP mode."
-                    )
-                    assert self.linear_num_value_heads % self.tensor_model_parallel_size == 0, (
-                        f"{self.linear_num_value_heads=} must be a multiple of "
-                        f"{self.tensor_model_parallel_size=} when using sequence_parallel CP mode."
-                    )
+            # Check tensor parallelism and context parallelism compatibility
+            # For SEQUENCE_PARALLEL mode: heads only need to be divisible by TP size
+            # For HEAD_PARALLEL mode: heads need to be divisible by TP * CP size
+            if cp_mode == "head_parallel":
+                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+                assert self.linear_num_key_heads % tp_cp_size == 0, (
+                    f"{self.linear_num_key_heads=} must be a multiple of "
+                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=}) "
+                    f"when using head_parallel CP mode."
+                )
+                assert self.linear_num_value_heads % tp_cp_size == 0, (
+                    f"{self.linear_num_value_heads=} must be a multiple of "
+                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=}) "
+                    f"when using head_parallel CP mode."
+                )
+            else:  # sequence_parallel
+                # Only need TP divisibility for sequence parallel mode
+                assert self.linear_num_key_heads % self.tensor_model_parallel_size == 0, (
+                    f"{self.linear_num_key_heads=} must be a multiple of "
+                    f"{self.tensor_model_parallel_size=} when using sequence_parallel CP mode."
+                )
+                assert self.linear_num_value_heads % self.tensor_model_parallel_size == 0, (
+                    f"{self.linear_num_value_heads=} must be a multiple of "
+                    f"{self.tensor_model_parallel_size=} when using sequence_parallel CP mode."
+                )
         elif self.experimental_attention_variant == "dsa":
             assert (
                 self.context_parallel_size == 1

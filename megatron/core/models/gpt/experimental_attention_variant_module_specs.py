@@ -4,6 +4,7 @@ from typing import Optional
 
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.kda import KDA, KDASubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
@@ -21,20 +22,35 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 
 def is_linear_attention_variant(experimental_attention_variant: str) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
+    linear_attention_variants = ["gated_delta_net", "kda"]
     return experimental_attention_variant in linear_attention_variants
 
 
 def get_gated_delta_net_module_spec_for_backend(
     backend: BackendSpecProvider, normalization: Optional[str] = None
 ) -> ModuleSpec:
-    """Helper function to get module spec for Linear Attention"""
+    """Helper function to get module spec for Gated Delta Net Linear Attention"""
     rms_norm = normalization == "RMSNorm"
     attention = ModuleSpec(
         module=GatedDeltaNet,
         submodules=GatedDeltaNetSubmodules(
             in_proj=backend.column_parallel_layer_norm_linear(),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+            out_proj=backend.row_parallel_linear(),
+        ),
+        metainfo={"fuse_input_layernorm": True},
+    )
+    return attention
+
+
+def get_kda_module_spec_for_backend(
+    backend: BackendSpecProvider, normalization: Optional[str] = None
+) -> ModuleSpec:
+    """Helper function to get module spec for KDA (Kimi Delta Attention)"""
+    attention = ModuleSpec(
+        module=KDA,
+        submodules=KDASubmodules(
+            in_proj=backend.column_parallel_layer_norm_linear(),
             out_proj=backend.row_parallel_linear(),
         ),
         metainfo={"fuse_input_layernorm": True},
@@ -120,6 +136,10 @@ def get_experimental_attention_variant_module_spec_for_backend(
     """Helper function to get module spec for Attention"""
     if experimental_attention_variant == "gated_delta_net":
         return get_gated_delta_net_module_spec_for_backend(
+            backend=backend, normalization=normalization
+        )
+    elif experimental_attention_variant == "kda":
+        return get_kda_module_spec_for_backend(
             backend=backend, normalization=normalization
         )
     elif experimental_attention_variant == "dsa":

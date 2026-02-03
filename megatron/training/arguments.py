@@ -3348,8 +3348,8 @@ def _add_mla_args(parser):
 
 def _add_experimental_attention_variant_args(parser):
     group = parser.add_argument_group(title="experimental_attention_variant")
-    group.add_argument('--experimental-attention-variant', default=None, choices=['gated_delta_net', 'dsa'], type=str,
-                       help='Type of attention variant to use. Currently support gated_delta_net and dsa.')
+    group.add_argument('--experimental-attention-variant', default=None, choices=['gated_delta_net', 'kda', 'dsa'], type=str,
+                       help='Type of attention variant to use. Currently support gated_delta_net, kda and dsa.')
 
     # Linear attention
     group.add_argument('--linear-attention-type', default=None, choices=['gated_delta_net'], type=str,
