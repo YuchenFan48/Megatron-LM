@@ -99,9 +99,9 @@ class DotProductAttention(MegatronModule):
         if is_layer_window_attention(
             self.config.window_size, self.config.window_attn_skip_freq, layer_number
         ):
-            window_size = self.config.window_size
+            self.window_size = self.config.window_size
         else:
-            window_size = None
+            self.window_size = None
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             input_in_fp16=self.config.fp16,
@@ -111,7 +111,7 @@ class DotProductAttention(MegatronModule):
             mask_func=attention_mask_func,
             softmax_in_fp32=self.config.attention_softmax_in_fp32,
             scale=coeff,
-            window_size=window_size,
+            window_size=self.window_size,
         )
 
         # Dropout. Note that for a single iteration, this layer will generate
@@ -189,6 +189,7 @@ class DotProductAttention(MegatronModule):
                 self.config.attention_dropout,
                 self.softmax_scale,
                 parallel_state.get_context_parallel_group(),
+                self.window_size,
             )
             output = output.view(query.shape[0], query.shape[1], self.hidden_size_per_partition)
             return output

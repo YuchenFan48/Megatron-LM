@@ -147,12 +147,134 @@ def to_zz_mask_attn_bias(attention_mask, cp_size, nheads, nheads_k, heads_k_stri
     return attn_bias
 
 
+def get_swa_mask_for_cp(sq_local, sk_total, window_size, cp_size, cp_rank, device):
+    """
+    Generate sliding window attention mask for context parallel.
+    
+    In zigzag (ZZ) partitioning with cp_size ranks:
+    - The sequence is split into 2*cp_size chunks
+    - rank i holds chunk[i] and chunk[2*cp_size-1-i]
+    
+    Args:
+        sq_local: local query sequence length per rank
+        sk_total: total key sequence length (after all-gather)
+        window_size: tuple of (left_window, right_window), where -1 means infinite
+        cp_size: context parallel size
+        cp_rank: current rank in context parallel group
+        device: device to create the mask on
+        
+    Returns:
+        mask: boolean mask of shape [sq_local, sk_total], True means masked (not attended)
+    """
+    left_window, right_window = window_size
+    
+    # Calculate chunk size
+    chunk_size = sq_local // 2  # Each rank holds 2 chunks
+    
+    # Create local query indices and map to global positions
+    # In ZZ: rank i holds positions from chunk[i] (first half) and chunk[2*cp_size-1-i] (second half)
+    local_q_indices = torch.arange(sq_local, device=device)
+    
+    # First half of local queries come from chunk[cp_rank]
+    # Second half come from chunk[2*cp_size-1-cp_rank]
+    first_chunk_global_start = cp_rank * chunk_size
+    second_chunk_global_start = (2 * cp_size - 1 - cp_rank) * chunk_size
+    
+    global_q_pos = torch.where(
+        local_q_indices < chunk_size,
+        local_q_indices + first_chunk_global_start,
+        (local_q_indices - chunk_size) + second_chunk_global_start
+    )
+    
+    # Create global key indices - after all-gather in ZZ order
+    # The all-gathered KV has layout: [chunk0, chunk7, chunk1, chunk6, chunk2, chunk5, chunk3, chunk4] for cp_size=4
+    local_k_indices = torch.arange(sk_total, device=device)
+    
+    # Map ZZ-ordered local k indices to global positions
+    k_chunk_idx = local_k_indices // chunk_size
+    k_pos_in_chunk = local_k_indices % chunk_size
+    
+    # In ZZ order: even positions (0,2,4,...) are from first half of chunks (0,1,2,...)
+    #              odd positions (1,3,5,...) are from second half reversed (2*cp_size-1, 2*cp_size-2, ...)
+    global_k_chunk = torch.where(
+        k_chunk_idx % 2 == 0,
+        k_chunk_idx // 2,  # Even: chunk[i//2]
+        2 * cp_size - 1 - k_chunk_idx // 2  # Odd: chunk[2*cp_size-1-i//2]
+    )
+    global_k_pos = global_k_chunk * chunk_size + k_pos_in_chunk
+    
+    # Calculate distance: positive means key is after query (future), negative means before (past)
+    # For causal attention with SWA: attend to keys within [q_pos - left_window, q_pos + right_window]
+    # distance[i, j] = global_k_pos[j] - global_q_pos[i]
+    distance = global_k_pos.unsqueeze(0) - global_q_pos.unsqueeze(1)  # [sq_local, sk_total]
+    
+    # Create mask: mask out positions outside the window
+    # Attend if: -left_window <= distance <= right_window
+    # Note: For causal SWA, right_window is typically 0 (can't attend to future)
+    if left_window == -1:
+        left_mask = torch.zeros_like(distance, dtype=torch.bool)
+    else:
+        left_mask = distance < -left_window  # Too far in the past
+    
+    if right_window == -1:
+        right_mask = torch.zeros_like(distance, dtype=torch.bool)
+    else:
+        right_mask = distance > right_window  # Too far in the future (or non-causal)
+    
+    mask = left_mask | right_mask
+    
+    return mask
+
+
+def to_zz_swa_attn_bias(sq_local, sk_total, window_size, cp_size, cp_rank, nheads, nheads_k, heads_k_stride, device, dtype):
+    """
+    Create attention bias for sliding window attention with context parallel.
+    
+    Args:
+        sq_local: local query sequence length
+        sk_total: total key sequence length after all-gather  
+        window_size: tuple of (left_window, right_window)
+        cp_size: context parallel size
+        cp_rank: current rank
+        nheads: number of query heads
+        nheads_k: number of key/value heads  
+        heads_k_stride: stride for iterating over kv heads
+        device: device
+        dtype: data type
+        
+    Returns:
+        attn_bias: attention bias of shape [1, heads_k_stride * (nheads // nheads_k), sq_local, sk_total]
+    """
+    # Get SWA mask for CP
+    swa_mask = get_swa_mask_for_cp(sq_local, sk_total, window_size, cp_size, cp_rank, device)
+    
+    # Convert to attention bias: [sq_local, sk_total] -> [1, 1, sq_local, sk_total]
+    swa_mask = swa_mask.unsqueeze(0).unsqueeze(0)
+    
+    attn_bias = torch.zeros(swa_mask.shape, device=device, dtype=dtype)
+    attn_bias.masked_fill_(swa_mask, float('-inf'))
+    attn_bias = attn_bias.expand(-1, heads_k_stride * (nheads // nheads_k), -1, -1)
+    
+    return attn_bias
+
+
 class AttentionFuncionWithContextParallel(torch.autograd.Function):
     """Native attention function with context parallelism."""
 
     @staticmethod
-    def forward(ctx, q, k, v, attention_mask, attention_dropout, softmax_scale, pg):
-        '''Forward pass for the native attention function with context parallelism'''
+    def forward(ctx, q, k, v, attention_mask, attention_dropout, softmax_scale, pg, window_size=None):
+        '''Forward pass for the native attention function with context parallelism
+        
+        Args:
+            q: query tensor of shape [s, b, h, d]
+            k: key tensor of shape [s, b, h_kv, d]
+            v: value tensor of shape [s, b, h_kv, d]
+            attention_mask: attention mask tensor
+            attention_dropout: dropout rate
+            softmax_scale: scale factor for softmax
+            pg: context parallel process group
+            window_size: optional tuple (left_window, right_window) for sliding window attention
+        '''
 
         # Assert einops exists
         if not HAVE_EINOPS:
@@ -160,8 +282,10 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
 
         # Initialize communication group and constants
         cp_size = 1
+        cp_rank = 0
         if pg is not None:
             cp_size = torch.distributed.get_world_size(pg)
+            cp_rank = torch.distributed.get_rank(pg)
         comm = AllGatherComm(group=pg)
         nheads = q.shape[2]
         nheads_k = k.shape[2]
@@ -184,10 +308,18 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         comm.all_gather(kv_buffer_copy[0], k_0)
         comm.all_gather(kv_buffer_copy[1], v_0)
 
-        # Prepare attention bias
-        attn_bias = to_zz_mask_attn_bias(
-            attention_mask, cp_size, nheads, nheads_k, heads_k_stride, q.device, q.dtype
-        )
+        # Prepare attention bias - use SWA mask if window_size is provided
+        sq_local = q.shape[0]  # local query sequence length
+        sk_total = k.shape[0] * cp_size  # total key sequence length after all-gather
+        if window_size is not None:
+            attn_bias = to_zz_swa_attn_bias(
+                sq_local, sk_total, window_size, cp_size, cp_rank,
+                nheads, nheads_k, heads_k_stride, q.device, q.dtype
+            )
+        else:
+            attn_bias = to_zz_mask_attn_bias(
+                attention_mask, cp_size, nheads, nheads_k, heads_k_stride, q.device, q.dtype
+            )
 
         # Iterate over heads
         for i in range(0, nheads_k, heads_k_stride):
@@ -230,6 +362,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         ctx.scale = softmax_scale
         ctx.heads_k_stride = heads_k_stride  # TODO make it configurable
         ctx.pg = pg
+        ctx.window_size = window_size
 
         return out
 
@@ -242,13 +375,16 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         nheads = q.shape[2]
         nheads_k = k.shape[2]
         heads_k_stride = ctx.heads_k_stride
+        window_size = ctx.window_size
         assert nheads_k % heads_k_stride == 0
         outs = rest[: nheads_k // heads_k_stride]
         probs = rest[nheads_k // heads_k_stride :]
         pg = ctx.pg
         cp_size = 1
+        cp_rank = 0
         if pg is not None:
             cp_size = torch.distributed.get_world_size(pg)
+            cp_rank = torch.distributed.get_rank(pg)
         comm = AllGatherComm(group=pg)
 
         # Initialize KV buffers
@@ -268,10 +404,18 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         comm.all_gather(kv_buffer_copy[0], k_0)
         comm.all_gather(kv_buffer_copy[1], v_0)
 
-        # Prepare attention bias
-        attn_bias = to_zz_mask_attn_bias(
-            attention_mask, cp_size, nheads, nheads_k, heads_k_stride, q.device, q.dtype
-        )
+        # Prepare attention bias - use SWA mask if window_size is provided
+        sq_local = q.shape[0]
+        sk_total = k.shape[0] * cp_size
+        if window_size is not None:
+            attn_bias = to_zz_swa_attn_bias(
+                sq_local, sk_total, window_size, cp_size, cp_rank,
+                nheads, nheads_k, heads_k_stride, q.device, q.dtype
+            )
+        else:
+            attn_bias = to_zz_mask_attn_bias(
+                attention_mask, cp_size, nheads, nheads_k, heads_k_stride, q.device, q.dtype
+            )
 
         # Iterate over heads
         for i in range(0, nheads_k, heads_k_stride):
@@ -339,4 +483,4 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
         dq = torch.cat(dq, dim=2)
         dk = torch.cat(dk, dim=2)
         dv = torch.cat(dv, dim=2)
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None
