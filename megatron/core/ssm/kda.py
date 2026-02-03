@@ -63,7 +63,6 @@ import os
 if not os.path.exists('/apdcephfs/mnt/cephfs/users/yuchenfan/flash-linear-attention'):
     raise ImportError("Hard code the path to flash-linear-attention in the code -> kda.py")
 sys.path.append('/apdcephfs/mnt/cephfs/users/yuchenfan/flash-linear-attention')
-from fla.modules.l2norm import l2norm
 from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
 from fla.modules import FusedRMSNormGated
 from fla.ops.kda import chunk_kda, fused_recurrent_kda
@@ -488,10 +487,8 @@ class KDA(MegatronModule):
         key = key.reshape(batch, local_seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, local_seq_len, -1, self.value_head_dim)
         
-        # Apply L2 norm to query and key
-        if self.use_qk_l2norm:
-            query = l2norm(query.contiguous())
-            key = l2norm(key.contiguous())
+        # Note: L2 norm is applied inside chunk_kda when use_qk_l2norm_in_kernel=True
+        # Handle GQA (grouped query attention) if num_value_heads > num_key_heads
         if self.num_value_heads // self.num_key_heads > 1:
             query = query.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
             key = key.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
@@ -517,6 +514,7 @@ class KDA(MegatronModule):
         initial_state = self._receive_state_from_prev_rank(batch)
         
         # Compute KDA with state passing
+        # Note: use_qk_l2norm_in_kernel=True to apply L2 norm inside the kernel (matches reference)
         if self.config.deterministic_mode:
             core_attn_out, final_state = torch_chunk_kda(
                 query,
@@ -526,7 +524,7 @@ class KDA(MegatronModule):
                 beta=beta,
                 initial_state=initial_state,
                 output_final_state=(self.cp_rank < self.cp_size - 1),  # Output state if not last rank
-                use_qk_l2norm_in_kernel=False,
+                use_qk_l2norm_in_kernel=self.use_qk_l2norm,
             )
         else:
             core_attn_out, final_state = chunk_kda(
@@ -537,7 +535,7 @@ class KDA(MegatronModule):
                 beta=beta,
                 initial_state=initial_state,
                 output_final_state=(self.cp_rank < self.cp_size - 1),
-                use_qk_l2norm_in_kernel=False,
+                use_qk_l2norm_in_kernel=self.use_qk_l2norm,
             )
         
         # Send final state to next CP rank (if not last rank)
@@ -841,10 +839,8 @@ class KDA(MegatronModule):
         key = key.reshape(batch, actual_seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, actual_seq_len, -1, self.value_head_dim)
             
-        # Apply L2 norm to query and key
-        if self.use_qk_l2norm:
-            query = l2norm(query.contiguous())
-            key = l2norm(key.contiguous())
+        # Note: L2 norm is applied inside chunk_kda when use_qk_l2norm_in_kernel=True
+        # Handle GQA (grouped query attention) if num_value_heads > num_key_heads
         if self.num_value_heads // self.num_key_heads > 1:
             query = query.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
             key = key.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
@@ -877,6 +873,7 @@ class KDA(MegatronModule):
         g = g.contiguous()
 
         nvtx_range_push(suffix="kda")
+        # Note: use_qk_l2norm_in_kernel=True to apply L2 norm inside the kernel (matches reference)
         if is_packed:
             # For packed sequences, process each sequence separately
             core_attn_out = self._packed_kda(
@@ -892,7 +889,7 @@ class KDA(MegatronModule):
                 beta=beta,
                 initial_state=None,
                 output_final_state=False,
-                use_qk_l2norm_in_kernel=False,
+                use_qk_l2norm_in_kernel=self.use_qk_l2norm,
             )
         else:
             core_attn_out, last_recurrent_state = chunk_kda(
@@ -903,7 +900,7 @@ class KDA(MegatronModule):
                 beta=beta,
                 initial_state=None,
                 output_final_state=False,
-                use_qk_l2norm_in_kernel=False,
+                use_qk_l2norm_in_kernel=self.use_qk_l2norm,
             )
         nvtx_range_pop(suffix="kda")
 
@@ -1058,7 +1055,7 @@ class KDA(MegatronModule):
                 beta=beta,
                 initial_state=None,
                 output_final_state=False,
-                use_qk_l2norm_in_kernel=False,
+                use_qk_l2norm_in_kernel=self.use_qk_l2norm,
                 cu_seqlens=cu_seqlens,
             )
             return core_attn_out
@@ -1088,7 +1085,7 @@ class KDA(MegatronModule):
                     beta=seq_beta,
                     initial_state=None,
                     output_final_state=False,
-                    use_qk_l2norm_in_kernel=False,
+                    use_qk_l2norm_in_kernel=self.use_qk_l2norm,
                 )
             else:
                 seq_out, _ = chunk_kda(
@@ -1099,7 +1096,7 @@ class KDA(MegatronModule):
                     beta=seq_beta,
                     initial_state=None,
                     output_final_state=False,
-                    use_qk_l2norm_in_kernel=False,
+                    use_qk_l2norm_in_kernel=self.use_qk_l2norm,
                 )
             
             output[:, start:end, :, :] = seq_out
