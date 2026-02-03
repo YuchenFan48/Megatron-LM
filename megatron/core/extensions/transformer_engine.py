@@ -983,6 +983,15 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"Transformer-Engine v{get_te_version()} must be >= 1.2.0 to support"
                 "sliding window attention."
             )
+            # Check if CP is enabled - Transformer Engine does not support SWA with CP
+            if self.config.context_parallel_size > 1:
+                raise ValueError(
+                    f"Transformer Engine does not support Sliding Window Attention (SWA) with "
+                    f"Context Parallelism (CP). Current config: window_size={config.window_size}, "
+                    f"context_parallel_size={self.config.context_parallel_size}. "
+                    f"Please use transformer_impl='local' (native implementation) instead, "
+                    f"which supports SWA with CP."
+                )
             extra_kwargs["window_size"] = config.window_size
 
         if is_te_min_version("1.10.0"):
