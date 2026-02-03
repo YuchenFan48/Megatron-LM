@@ -1967,20 +1967,8 @@ class TransformerConfig(ModelParallelConfig):
                         f"for context parallelism, but got {self.cp_comm_type=} instead."
                     )
 
-        # Check if SWA + CP is used with Transformer Engine (not supported)
-        if (
-            self.transformer_impl == "transformer_engine"
-            and self.window_size is not None
-            and self.context_parallel_size > 1
-        ):
-            raise ValueError(
-                f"Transformer Engine does not support Sliding Window Attention (SWA) with "
-                f"Context Parallelism (CP). Current config: window_size={self.window_size}, "
-                f"context_parallel_size={self.context_parallel_size}, "
-                f"transformer_impl={self.transformer_impl}. "
-                f"Please set transformer_impl='local' (native implementation) to use SWA with CP, "
-                f"or disable either SWA (window_size=None) or CP (context_parallel_size=1)."
-            )
+        # Note: SWA + CP with Transformer Engine is now supported via attention_bias
+        # The implementation generates SWA masks manually and passes them through attention_bias
 
         if self.transformer_impl == "inference_optimized":
             assert self.normalization == "RMSNorm"

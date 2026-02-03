@@ -43,6 +43,9 @@ from megatron.core.transformer.utils import (
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
 )
+from megatron.core.transformer.dot_product_attention_context_parallel import (
+    to_zz_swa_attn_bias,
+)
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
@@ -931,6 +934,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     pg_collection, "hcp"
                 ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
         self._tp_group = pg_collection.tp
+        self._pg_collection = pg_collection  # Save for use in forward()
 
         if is_te_min_version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
@@ -983,16 +987,18 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"Transformer-Engine v{get_te_version()} must be >= 1.2.0 to support"
                 "sliding window attention."
             )
-            # Check if CP is enabled - Transformer Engine does not support SWA with CP
+            # Store window_size for use in forward pass
+            # If CP is enabled, we'll use attention_bias instead of window_size parameter
             if self.config.context_parallel_size > 1:
-                raise ValueError(
-                    f"Transformer Engine does not support Sliding Window Attention (SWA) with "
-                    f"Context Parallelism (CP). Current config: window_size={config.window_size}, "
-                    f"context_parallel_size={self.config.context_parallel_size}. "
-                    f"Please use transformer_impl='local' (native implementation) instead, "
-                    f"which supports SWA with CP."
-                )
-            extra_kwargs["window_size"] = config.window_size
+                # Don't pass window_size to TE when CP is enabled
+                # We'll generate SWA mask manually in forward() and pass via attention_bias
+                self.use_swa_with_cp = True
+                self.window_size = config.window_size
+            else:
+                # Normal SWA without CP - use TE's built-in window_size support
+                extra_kwargs["window_size"] = config.window_size
+                self.use_swa_with_cp = False
+                self.window_size = None
 
         if is_te_min_version("1.10.0"):
             # TE 1.10.0 introduces the ability to set the different k and v channels
@@ -1092,14 +1098,91 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         )
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
+        # Generate SWA mask for CP if needed
+        swa_attention_bias = None
+        if hasattr(self, 'use_swa_with_cp') and self.use_swa_with_cp and self.window_size is not None:
+            assert is_te_min_version("1.2.0"), (
+                f"Transformer-Engine v{get_te_version()} must be >= 1.2.0 to support"
+                "`attention_bias` for SWA with CP."
+            )
+            
+            # Get CP information
+            pg_collection = self._pg_collection if hasattr(self, '_pg_collection') else None
+            cp_group = pg_collection.cp if pg_collection is not None else get_context_parallel_group(check_initialized=False)
+            cp_size = 1
+            cp_rank = 0
+            if cp_group is not None:
+                cp_size = torch.distributed.get_world_size(cp_group)
+                cp_rank = torch.distributed.get_rank(cp_group)
+            
+            # Determine sequence lengths based on tensor format
+            if qkv_format == "sbhd":
+                sq_local = query.shape[0]  # [s, b, h, d]
+                sk_total = key.shape[0] * cp_size
+            elif qkv_format == "bshd":
+                sq_local = query.shape[1]  # [b, s, h, d]
+                sk_total = key.shape[1] * cp_size
+            elif qkv_format == "thd":
+                # thd format: [total_tokens, num_heads, head_dim]
+                # Need to get sequence length from cu_seqlens if available
+                if packed_seq_params is not None and hasattr(packed_seq_params, 'cu_seqlens_q'):
+                    # For thd format with packed sequences
+                    cu_seqlens_q = packed_seq_params.cu_seqlens_q
+                    if len(cu_seqlens_q) > 1:
+                        sq_local = (cu_seqlens_q[-1] - cu_seqlens_q[0]) // cp_size
+                        sk_total = sq_local * cp_size
+                    else:
+                        sq_local = query.shape[0] // cp_size
+                        sk_total = query.shape[0]
+                else:
+                    sq_local = query.shape[0] // cp_size
+                    sk_total = query.shape[0]
+            else:
+                # Default: assume sbhd format
+                sq_local = query.shape[0]
+                sk_total = key.shape[0] * cp_size
+            
+            # Get number of heads
+            nheads = query.shape[2] if len(query.shape) > 2 else 1
+            nheads_k = key.shape[2] if len(key.shape) > 2 else nheads
+            heads_k_stride = 1
+            
+            # Generate SWA attention bias
+            # to_zz_swa_attn_bias returns [1, nheads, sq_local, sk_total]
+            swa_attention_bias = to_zz_swa_attn_bias(
+                sq_local, sk_total, self.window_size, cp_size, cp_rank,
+                nheads, nheads_k, heads_k_stride, query.device, query.dtype
+            )
+            
+            # Adjust shape for different formats to match TE's expected format
+            # TE expects attention_bias shape: [batch, num_heads, seq_len_q, seq_len_kv]
+            if qkv_format == "sbhd":
+                # Query shape: [s, b, h, d] -> batch is at dim 1
+                batch_size = query.shape[1]
+                # Expand from [1, nheads, sq, sk] to [b, nheads, sq, sk]
+                swa_attention_bias = swa_attention_bias.expand(batch_size, -1, -1, -1)
+            elif qkv_format == "bshd":
+                # Query shape: [b, s, h, d] -> batch is at dim 0
+                batch_size = query.shape[0]
+                # Expand from [1, nheads, sq, sk] to [b, nheads, sq, sk]
+                swa_attention_bias = swa_attention_bias.expand(batch_size, -1, -1, -1)
+            elif qkv_format == "thd":
+                # thd format: [total_tokens, num_heads, head_dim]
+                # For packed sequences, TE handles the bias internally
+                # We keep the shape as [1, nheads, sq, sk] and let TE handle it
+                # Note: This may need special handling for packed sequences
+                pass
+
         attention_bias_kwargs = {}
-        if attention_bias is not None:
+        # Use SWA bias if generated, otherwise use provided attention_bias
+        final_attention_bias = swa_attention_bias if swa_attention_bias is not None else attention_bias
+        if final_attention_bias is not None:
             assert is_te_min_version("1.2.0"), (
                 f"Transformer-Engine v{get_te_version()} must be >= 1.2.0 to support"
                 "`attention_bias`."
             )
             attention_bias_kwargs = dict(
-                core_attention_bias_type="post_scale_bias", core_attention_bias=attention_bias
+                core_attention_bias_type="post_scale_bias", core_attention_bias=final_attention_bias
             )
 
         if attn_mask_type == AttnMaskType.no_mask and self.config.window_size is not None:
