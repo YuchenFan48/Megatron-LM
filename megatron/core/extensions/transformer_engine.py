@@ -1176,11 +1176,27 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attention_bias_kwargs = {}
         # Use SWA bias if generated, otherwise use provided attention_bias
         final_attention_bias = swa_attention_bias if swa_attention_bias is not None else attention_bias
+        
+        # Note: Transformer Engine may not support attention_bias with CP in all backends
+        # If this fails, the user should use transformer_impl='local' instead
         if final_attention_bias is not None:
             assert is_te_min_version("1.2.0"), (
                 f"Transformer-Engine v{get_te_version()} must be >= 1.2.0 to support"
                 "`attention_bias`."
             )
+            
+            # Check if we're using SWA + CP - TE may not support this combination
+            cp_enabled = self.config.context_parallel_size > 1
+            if swa_attention_bias is not None and cp_enabled:
+                # SWA + CP with TE: This may not be supported by all TE backends
+                # If TE fails to find a backend, it will raise an error
+                # In that case, user should use transformer_impl='local'
+                warnings.warn(
+                    "Using SWA + CP with Transformer Engine. If you encounter backend errors, "
+                    "please use transformer_impl='local' instead, which has full SWA + CP support.",
+                    UserWarning
+                )
+            
             attention_bias_kwargs = dict(
                 core_attention_bias_type="post_scale_bias", core_attention_bias=final_attention_bias
             )
