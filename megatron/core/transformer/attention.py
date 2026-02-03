@@ -801,9 +801,12 @@ class Attention(MegatronModule, ABC):
         if self.offload_qkv_linear:
             hidden_states = fine_grained_offloading_group_start(hidden_states, name="qkv_linear")
         with get_fine_grained_offloading_context(self.offload_qkv_linear):
-            qkv_output = self.get_query_key_value_tensors(
-                hidden_states, key_value_states, output_gate=output_gate, split_qkv=split_qkv
-            )
+            if self.config.use_gated_attention:
+                qkv_output = self.get_query_gate_key_value_tensors(hidden_states, key_value_states)
+            else:
+                qkv_output = self.get_query_key_value_tensors(
+                    hidden_states, key_value_states, output_gate=output_gate, split_qkv=split_qkv
+                )
         if self.offload_qkv_linear:
             (qkv_output,) = fine_grained_offloading_group_commit(
                 qkv_output, name="qkv_linear", forced_released_tensors=[]
@@ -812,7 +815,9 @@ class Attention(MegatronModule, ABC):
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
-        if output_gate and split_qkv:
+        if self.config.use_gated_attention:
+            query, gate, key, value = qkv_output
+        elif output_gate and split_qkv:
             query, key, value, gate = qkv_output
         elif split_qkv:
             query, key, value = qkv_output
@@ -1006,7 +1011,10 @@ class Attention(MegatronModule, ABC):
         # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
-            core_attn_out = self._apply_output_gate(core_attn_out, gate)
+            if self.config.use_gated_attention:
+                core_attn_out = core_attn_out * torch.sigmoid(gate)
+            else:
+                core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
         # =================
@@ -1073,22 +1081,38 @@ class SelfAttention(Attention):
             pg_collection=pg_collection,
         )
 
-        self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
-        if self.config.attention_output_gate:
-            self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
-        self.linear_qkv = build_module(
-            submodules.linear_qkv,
-            self.config.hidden_size,
-            self.linear_qkv_out_dim,
-            config=self.config,
-            init_method=self.config.init_method,
-            gather_output=False,
-            bias=self.config.add_bias_linear or self.config.add_qkv_bias,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name='qkv',
-            tp_group=self.pg_collection.tp,
-        )
+        if self.config.use_gated_attention:
+            # Gated attention: Q, Gate, K, V with doubled Q+KV projection size
+            self.linear_qgkv = build_module(
+                submodules.linear_qkv,
+                self.config.hidden_size,
+                2 * (self.query_projection_size + self.kv_projection_size),
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=self.config.add_bias_linear or self.config.add_qkv_bias,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='qkv',
+                tp_group=self.pg_collection.tp,
+            )
+        else:
+            self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
+            if self.config.attention_output_gate:
+                self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
+            self.linear_qkv = build_module(
+                submodules.linear_qkv,
+                self.config.hidden_size,
+                self.linear_qkv_out_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=self.config.add_bias_linear or self.config.add_qkv_bias,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='qkv',
+                tp_group=self.pg_collection.tp,
+            )
 
         if submodules.q_layernorm is not None:
             self.q_layernorm = build_module(
@@ -1262,6 +1286,63 @@ class SelfAttention(Attention):
 
         return query, key, value
 
+    # Adapted from https://github.com/alibaba/Pai-Megatron-Patch/blob/8e6cbb0556ba09933ab4a4edb23c0af1d19d9960/megatron_patch/model/qwen3_next/gated_attention.py#L192
+    def get_query_gate_key_value_tensors(self, hidden_states, key_value_states=None):
+        """
+        Derives `query`, `gate`, `key` and `value` tensors from `hidden_states` for gated attention.
+        """
+        # Attention heads [sq, b, h] --> [sq, b, ng * 2 * (np/ng + 1) * hn)]
+        mixed_qgkv, _ = self.linear_qgkv(hidden_states)
+
+        # [sq, b, hp] --> [sq, b, ng, 2 * (np/ng + 1) * hn]
+        new_tensor_shape = mixed_qgkv.size()[:-1] + (
+            self.num_query_groups_per_partition,
+            (
+                2 * (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 1)
+                * self.hidden_size_per_attention_head
+            ),
+        )
+        mixed_qgkv = mixed_qgkv.view(*new_tensor_shape)
+
+        split_arg_list = [
+            (
+                self.num_attention_heads_per_partition
+                // self.num_query_groups_per_partition
+                * self.hidden_size_per_attention_head
+            ),
+            (
+                self.num_attention_heads_per_partition
+                // self.num_query_groups_per_partition
+                * self.hidden_size_per_attention_head
+            ),
+            self.hidden_size_per_attention_head,
+            self.hidden_size_per_attention_head,
+        ]
+
+        if SplitAlongDim is not None:
+            # [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query, gate, key, value) = SplitAlongDim(mixed_qgkv, 3, split_arg_list)
+        else:
+            # [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query, gate, key, value) = torch.split(mixed_qgkv, split_arg_list, dim=3)
+
+        # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+        gate = gate.reshape(query.size(0), query.size(1), -1)
+
+        if self.q_layernorm is not None:
+            query = self.q_layernorm(query)
+
+        if self.k_layernorm is not None:
+            key = self.k_layernorm(key)
+
+        if self.config.test_mode:
+            self.run_realtime_tests()
+
+        return query, gate, key, value
+
     def backward_dw(self) -> NoReturn:
         """Execute weight update operations"""
         self._backward_qkv_proj()
@@ -1269,7 +1350,10 @@ class SelfAttention(Attention):
 
     def _backward_qkv_proj(self):
         """Update weights for QKV projection layer"""
-        self.linear_qkv.backward_dw()
+        if self.config.use_gated_attention:
+            self.linear_qgkv.backward_dw()
+        else:
+            self.linear_qkv.backward_dw()
 
     def _backward_output_proj(self):
         """Update weights for output projection layer"""
@@ -1279,7 +1363,10 @@ class SelfAttention(Attention):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
         from megatron.core.extensions.transformer_engine import set_save_original_input
 
-        set_save_original_input(self.linear_qkv)
+        if self.config.use_gated_attention:
+            set_save_original_input(self.linear_qgkv)
+        else:
+            set_save_original_input(self.linear_qkv)
 
     def clip_qk(self):
         """

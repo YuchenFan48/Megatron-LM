@@ -1400,6 +1400,7 @@ def core_transformer_config_from_args(args, config_class=None):
 
     kw_args['post_self_attn_layernorm'] = args.post_self_attn_layernorm
     kw_args['post_mlp_layernorm'] = args.post_mlp_layernorm
+    kw_args['use_gated_attention'] = args.use_gated_attention
 
     # handle quantization config
     # NOTE: Kitchen arguments are only added to the namespace when
