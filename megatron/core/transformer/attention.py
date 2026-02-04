@@ -1368,6 +1368,12 @@ class SelfAttention(Attention):
         else:
             set_save_original_input(self.linear_qkv)
 
+    def _get_name(self):
+        """Return the name to display in model print/repr."""
+        if self.config.use_gated_attention:
+            return "GatedAttention"
+        return "SelfAttention"
+
     def clip_qk(self):
         """
         QK Clipping is a technique to clip the query and key attention logits to prevent the

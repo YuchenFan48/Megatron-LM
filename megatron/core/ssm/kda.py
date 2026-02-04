@@ -220,11 +220,11 @@ class KDA(MegatronModule):
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
 
-        # Input projection (hidden_states -> q, k, v, f_gate_a, g_gate_a, beta)
-        # f_gate_a: for forget gate (first stage projection to head_dim)
-        # g_gate_a: for output gate (first stage projection to head_dim)
+        # Input projection (hidden_states -> q, k, v, beta)
+        # NOTE: f_gate_a and g_gate_a are kept as separate low-rank projections
+        # because they should NOT be sharded by TP (they're shared across heads).
         # beta: for the beta parameter
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim + self.value_head_dim * 2 + self.num_value_heads
+        self.in_proj_dim = self.qk_dim * 2 + self.v_dim + self.num_value_heads
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
             assert self.in_proj_dim % fp8_align_size == 0, (
@@ -243,6 +243,24 @@ class KDA(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+        )
+        
+        # Low-rank projections for gates (NOT TP-sharded, shared across heads)
+        # f_a_proj: first stage of forget gate low-rank projection
+        # g_a_proj: first stage of output gate low-rank projection
+        self.f_a_proj = nn.Linear(
+            self.hidden_size,
+            self.value_head_dim,
+            bias=False,
+            device=torch.cuda.current_device(),
+            dtype=config.params_dtype,
+        )
+        self.g_a_proj = nn.Linear(
+            self.hidden_size,
+            self.value_head_dim,
+            bias=False,
+            device=torch.cuda.current_device(),
+            dtype=config.params_dtype,
         )
 
         # Conv1d for QKV (no gate)
@@ -449,18 +467,21 @@ class KDA(MegatronModule):
         
         # Transpose: s b x --> b s x
         proj_out = proj_out.transpose(0, 1)
+        hidden_states_bsz = hidden_states.transpose(0, 1)  # s b h -> b s h
         
-        # Split into q, k, v, f_gate_a, g_gate_a, beta
-        qkv, f_gate_a, g_gate_a, beta = torch.split(
+        # Split into q, k, v, beta (f_gate_a and g_gate_a come from separate projections)
+        qkv, beta = torch.split(
             proj_out,
             [
                 self.qk_dim_local_tp * 2 + self.v_dim_local_tp,
-                self.value_head_dim,  # f_gate_a is first stage projection
-                self.value_head_dim,  # g_gate_a is first stage projection
                 self.num_value_heads // self.tp_size,
             ],
             dim=-1,
         )
+        
+        # Low-rank projections for gates (not TP-sharded)
+        f_gate_a = self.f_a_proj(hidden_states_bsz)  # (batch, seq, head_dim)
+        g_gate_a = self.g_a_proj(hidden_states_bsz)  # (batch, seq, head_dim)
         
         beta = beta.reshape(batch, local_seq_len, -1)
         
@@ -683,6 +704,7 @@ class KDA(MegatronModule):
 
         # CP All to All: CP to HP (gather sequence, shard heads)
         # This applies to both packed and non-packed sequences when CP > 1
+        # NOTE: Only QKV and beta go through all-to-all, f_gate_a/g_gate_a are separate
         proj_out = tensor_a2a_cp2hp(
             proj_out,
             seq_dim=0,
@@ -692,9 +714,7 @@ class KDA(MegatronModule):
                 self.qk_dim_local_tp,
                 self.qk_dim_local_tp,
                 self.v_dim_local_tp,
-                self.value_head_dim,  # f_gate_a - NOT split by CP (low-rank)
-                self.value_head_dim,  # g_gate_a - NOT split by CP (low-rank)
-                self.num_value_heads // self.tp_size,
+                self.num_value_heads // self.tp_size,  # beta
             ],
         )
         
@@ -711,19 +731,41 @@ class KDA(MegatronModule):
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
         proj_out = proj_out.transpose(0, 1)
+        hidden_states_bsz = hidden_states.transpose(0, 1)  # s b h -> b s h (local seq)
 
-        # Split, reorder, and reshape the tensor into q, k, v, f_gate_a, g_gate_a, beta
+        # Split, reorder, and reshape the tensor into q, k, v, beta
         # After all-to-all, the head dimension is sharded by cp_size for QKV and beta
-        qkv, f_gate_a, g_gate_a, beta = torch.split(
+        # NOTE: f_gate_a and g_gate_a come from separate low-rank projections
+        qkv, beta = torch.split(
             proj_out,
             [
                 (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
-                self.value_head_dim,  # f_gate_a is NOT sharded by CP
-                self.value_head_dim,  # g_gate_a is NOT sharded by CP
                 self.num_value_heads // self.tp_size // self.cp_size,
             ],
             dim=-1,
         )
+        
+        # Low-rank projections for gates (not TP/CP head-sharded)
+        # First compute on local sequence chunk
+        f_gate_a_local = self.f_a_proj(hidden_states_bsz)  # (batch, seq_local, head_dim)
+        g_gate_a_local = self.g_a_proj(hidden_states_bsz)  # (batch, seq_local, head_dim)
+        
+        # Gather f_gate_a and g_gate_a across CP ranks to match gathered sequence
+        if self.cp_size > 1:
+            # All-gather to get full sequence
+            f_gate_a_list = [torch.empty_like(f_gate_a_local) for _ in range(self.cp_size)]
+            g_gate_a_list = [torch.empty_like(g_gate_a_local) for _ in range(self.cp_size)]
+            torch.distributed.all_gather(f_gate_a_list, f_gate_a_local, group=self.pg_collection.cp)
+            torch.distributed.all_gather(g_gate_a_list, g_gate_a_local, group=self.pg_collection.cp)
+            f_gate_a = torch.cat(f_gate_a_list, dim=1)  # (batch, seq_global, head_dim)
+            g_gate_a = torch.cat(g_gate_a_list, dim=1)  # (batch, seq_global, head_dim)
+            
+            # Apply load balancing reordering to match the gathered QKV
+            f_gate_a = _undo_attention_load_balancing(f_gate_a.transpose(0, 1), self.cp_size).transpose(0, 1)
+            g_gate_a = _undo_attention_load_balancing(g_gate_a.transpose(0, 1), self.cp_size).transpose(0, 1)
+        else:
+            f_gate_a = f_gate_a_local
+            g_gate_a = g_gate_a_local
         
         if is_packed:
             # For packed: batch=1, seq_len=total_tokens_global (gathered across CP)
@@ -1140,13 +1182,24 @@ class KDA(MegatronModule):
                     dp_cp_group=metadata['dp_cp_group'],
                 )
             elif name in ["f_b_proj", "g_b_proj"]:
-                # Add TP sharding for projection layers
+                # Add TP sharding for projection layers (second stage, TP-sharded)
                 module_sd = module.state_dict(prefix="", keep_vars=True)
                 tp_sharding_map = {"weight": 0}
                 module_sharded_sd = make_sharded_tensors_for_checkpoint(
                     module_sd,
                     f"{prefix}{name}.",
                     tp_sharding_map,
+                    sharded_offsets,
+                    tp_group=tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
+                )
+            elif name in ["f_a_proj", "g_a_proj"]:
+                # Low-rank projections are NOT TP-sharded (replicated across TP ranks)
+                module_sd = module.state_dict(prefix="", keep_vars=True)
+                module_sharded_sd = make_sharded_tensors_for_checkpoint(
+                    module_sd,
+                    f"{prefix}{name}.",
+                    {},  # No TP sharding for low-rank projections
                     sharded_offsets,
                     tp_group=tp_group,
                     dp_cp_group=metadata['dp_cp_group'],
@@ -1177,17 +1230,16 @@ class KDA(MegatronModule):
             sharded_state_dict[f"{prefix}in_proj.weight"],
         )
 
+        # in_proj now only contains q, k, v, beta (f_gate_a and g_gate_a are separate)
         sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
             sharded_state_dict[f"{prefix}in_proj.weight"],
             [
                 self.qk_dim_local_tp,
                 self.qk_dim_local_tp,
                 self.v_dim_local_tp,
-                self.value_head_dim,  # f_gate_a
-                self.value_head_dim,  # g_gate_a
                 self.num_value_heads // self.tp_size,  # beta
             ],
-            ["query", "key", "value", "f_gate_a", "g_gate_a", "beta"],
+            ["query", "key", "value", "beta"],
             0,
         )
 
@@ -1465,94 +1517,142 @@ def torch_chunk_kda(
 ):
     '''
     Torch-native implementation of chunked KDA for deterministic mode.
-    Need this because FLA is not deterministic.
-
-    This is an approximation based on the gated delta rule structure.
-    For exact KDA computation, use the FLA implementation.
+    
+    NOTE: This is a simplified approximation of KDA for deterministic mode.
+    The full KDA algorithm involves complex interactions between the delta rule
+    and gating that are difficult to implement efficiently in pure PyTorch.
+    
+    For production use, the FLA Triton implementation (chunk_kda) should be used.
+    This fallback is provided for debugging and testing purposes only.
+    
+    WARNING: Results may differ from the FLA implementation!
     '''
     from fla.modules.l2norm import l2norm
+    
+    logger.warning(
+        "Using torch_chunk_kda fallback for deterministic mode. "
+        "This is an approximation and may produce different results from FLA's chunk_kda. "
+        "For accurate results, disable deterministic_mode."
+    )
 
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
         query = l2norm(query, dim=-1, eps=1e-6)
         key = l2norm(key, dim=-1, eps=1e-6)
     
-    query, key, value, beta = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta)
-    ]
-    # g has shape (batch, seq, heads, head_dim), needs different handling
-    g = g.transpose(1, 2).contiguous().to(torch.float32)
-
-    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    # query, key, value: (batch, seq, heads, head_dim)
+    # g: (batch, seq, heads, head_dim) - per-element gate in log space
+    # beta: (batch, seq, heads)
+    
+    batch_size, sequence_length, num_heads, k_head_dim = query.shape
     v_head_dim = value.shape[-1]
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    query = F.pad(query, (0, 0, 0, pad_size))
-    key = F.pad(key, (0, 0, 0, pad_size))
-    value = F.pad(value, (0, 0, 0, pad_size))
-    beta = F.pad(beta, (0, pad_size))
-    g = F.pad(g, (0, 0, 0, pad_size))
-    total_sequence_length = sequence_length + pad_size
-    scale = 1 / (query.shape[-1] ** 0.5)
+    
+    # Transpose to (batch, heads, seq, dim) for computation
+    query = query.transpose(1, 2).contiguous().to(torch.float32)
+    key = key.transpose(1, 2).contiguous().to(torch.float32)
+    value = value.transpose(1, 2).contiguous().to(torch.float32)
+    g = g.transpose(1, 2).contiguous().to(torch.float32)
+    beta = beta.transpose(1, 2).contiguous().to(torch.float32)
+    
+    scale = 1 / (k_head_dim ** 0.5)
     query = query * scale
-
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
-    # reshape to chunks
-    query, key, value, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
-        for x in (query, key, value, k_beta, v_beta)
-    ]
-    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size, g.shape[-1])
-    mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
-    )
-
-    # chunk decay - for KDA, g has per-element decay (not per-head like GDN)
-    g_cumsum = g.cumsum(dim=-2)  # cumsum over sequence dimension within chunk
     
-    # For the decay mask, we need to handle the per-element g
-    # decay_mask[i,j] = exp(sum_{t=j+1}^{i} g[t]) for i > j
-    # This is a simplification - proper KDA has more complex decay
-    g_sum = g_cumsum.sum(dim=-1)  # (batch, heads, num_chunks, chunk_size)
-    decay_mask = ((g_sum.unsqueeze(-1) - g_sum.unsqueeze(-2)).tril().exp().float()).tril()
+    # Pad to chunk_size
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    if pad_size > 0:
+        query = F.pad(query, (0, 0, 0, pad_size))
+        key = F.pad(key, (0, 0, 0, pad_size))
+        value = F.pad(value, (0, 0, 0, pad_size))
+        g = F.pad(g, (0, 0, 0, pad_size))
+        beta = F.pad(beta, (0, pad_size))
     
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g_sum.exp().unsqueeze(-1))
-    last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
-        if initial_state is None
-        else initial_state.to(value)
+    total_seq_len = sequence_length + pad_size
+    num_chunks = total_seq_len // chunk_size
+    
+    # Reshape to chunks: (batch, heads, num_chunks, chunk_size, dim)
+    query = query.reshape(batch_size, num_heads, num_chunks, chunk_size, k_head_dim)
+    key = key.reshape(batch_size, num_heads, num_chunks, chunk_size, k_head_dim)
+    value = value.reshape(batch_size, num_heads, num_chunks, chunk_size, v_head_dim)
+    g = g.reshape(batch_size, num_heads, num_chunks, chunk_size, k_head_dim)
+    beta = beta.reshape(batch_size, num_heads, num_chunks, chunk_size)
+    
+    # Compute cumulative sum of g within each chunk (for decay)
+    # g_cumsum[t] = sum_{i=0}^{t} g[i]
+    g_cumsum = g.cumsum(dim=3)  # (batch, heads, num_chunks, chunk_size, head_dim)
+    
+    # Initialize recurrent state: (batch, heads, k_head_dim, v_head_dim)
+    if initial_state is None:
+        h = torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, 
+                        dtype=torch.float32, device=query.device)
+    else:
+        h = initial_state.to(torch.float32)
+    
+    # Output buffer
+    output = torch.zeros_like(value)
+    
+    # Process each chunk
+    causal_mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), 
+        diagonal=1
     )
-    core_attn_out = torch.zeros_like(value)
-    mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
-    )
-
-    # for each chunk
-    for i in range(0, total_sequence_length // chunk_size):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        g_i = g_sum[:, :, i]  # (batch, heads, chunk_size)
-        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
-        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
-        v_new = v_i - v_prime
-        attn_inter = (q_i * g_i[..., None].exp()) @ last_recurrent_state
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new
-        last_recurrent_state = (
-            last_recurrent_state * g_i[:, :, -1, None, None].exp()
-            + (k_i * (g_i[:, :, -1, None] - g_i).exp()[..., None]).transpose(-1, -2) @ v_new
-        )
-
-    if not output_final_state:
-        last_recurrent_state = None
-    core_attn_out = core_attn_out.reshape(
-        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
-    )
-    core_attn_out = core_attn_out[:, :, :sequence_length]
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
-    return core_attn_out, last_recurrent_state
+    
+    for c in range(num_chunks):
+        q_c = query[:, :, c]  # (batch, heads, chunk_size, k_dim)
+        k_c = key[:, :, c]    # (batch, heads, chunk_size, k_dim)
+        v_c = value[:, :, c]  # (batch, heads, chunk_size, v_dim)
+        g_c = g[:, :, c]      # (batch, heads, chunk_size, k_dim)
+        g_cumsum_c = g_cumsum[:, :, c]  # (batch, heads, chunk_size, k_dim)
+        beta_c = beta[:, :, c]  # (batch, heads, chunk_size)
+        
+        # For each position in the chunk, compute:
+        # 1. Inter-chunk attention (from recurrent state h)
+        # 2. Intra-chunk attention (within this chunk)
+        
+        # Inter-chunk: q @ h (with decay)
+        # decay factor for each position: exp(g_cumsum[t])
+        # Average over head_dim for simplicity (approximation!)
+        g_cumsum_mean = g_cumsum_c.mean(dim=-1, keepdim=True)  # (batch, heads, chunk_size, 1)
+        inter_out = torch.einsum('bhti,bhiv->bhtv', 
+                                 q_c * g_cumsum_mean.exp(), h)
+        
+        # Intra-chunk: standard attention with decay
+        # attn[i,j] = q[i] @ k[j] * exp(g_cumsum[i] - g_cumsum[j]) for j <= i
+        # Approximation: use mean over head_dim for the decay
+        g_diff = g_cumsum_mean - g_cumsum_mean.transpose(-2, -1).transpose(-1, -2)
+        decay = g_diff[..., 0].exp()  # (batch, heads, chunk_size, chunk_size)
+        
+        attn = torch.einsum('bhik,bhjk->bhij', q_c, k_c) * decay
+        attn = attn.masked_fill(causal_mask, 0)
+        
+        # Apply beta to value
+        v_beta = v_c * beta_c.unsqueeze(-1)
+        intra_out = torch.einsum('bhij,bhjv->bhiv', attn, v_beta)
+        
+        output[:, :, c] = inter_out + intra_out
+        
+        # Update recurrent state
+        # h = h * exp(sum(g_c)) + sum_t(k[t] * v[t] * beta[t] * exp(g_cumsum[T] - g_cumsum[t]))
+        g_end = g_cumsum_c[:, :, -1:, :]  # (batch, heads, 1, k_dim)
+        g_end_mean = g_end.mean(dim=-1, keepdim=True)
+        
+        # Decay existing state
+        h = h * g_end_mean[:, :, 0, :].exp()
+        
+        # Add new information
+        for t in range(chunk_size):
+            decay_t = (g_end_mean[:, :, 0, 0] - g_cumsum_mean[:, :, t, 0]).exp()
+            k_t = k_c[:, :, t, :]  # (batch, heads, k_dim)
+            v_t = v_c[:, :, t, :]  # (batch, heads, v_dim)
+            beta_t = beta_c[:, :, t:t+1]  # (batch, heads, 1)
+            
+            # outer product: k_t^T @ v_t -> (batch, heads, k_dim, v_dim)
+            update = torch.einsum('bhk,bhv->bhkv', k_t, v_t * beta_t)
+            h = h + update * decay_t.unsqueeze(-1).unsqueeze(-1)
+    
+    # Reshape output
+    output = output.reshape(batch_size, num_heads, total_seq_len, v_head_dim)
+    output = output[:, :, :sequence_length, :]  # Remove padding
+    output = output.transpose(1, 2).contiguous().to(initial_dtype)
+    
+    final_state = h if output_final_state else None
+    return output, final_state
