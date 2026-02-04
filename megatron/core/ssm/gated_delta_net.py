@@ -307,6 +307,11 @@ class GatedDeltaNet(MegatronModule):
         )
 
         self.reset_parameters()
+        print(f"[GatedDeltaNet] Layer {layer_number} initialized with Gated Delta Net")
+
+    def _get_name(self):
+        """Return the name to display in model print/repr."""
+        return "GatedDeltaNet"
 
     def reset_parameters(self):
         """Reset the parameters."""
@@ -641,14 +646,18 @@ class GatedDeltaNet(MegatronModule):
             # cu_seqlens represents GLOBAL sequence boundaries (same on all CP ranks)
             cu_seqlens_global = packed_seq_params.cu_seqlens_q
             # After all-to-all, we'll have the full sequence gathered
+            # Note: Only multiply by cp_size, NOT sp_size!
             total_tokens_global = total_tokens_local * self.cp_size
-            seq_len = total_tokens_global * self.sp_size
+            seq_len = total_tokens_global
             # We'll compute cu_seqlens and seq_idx after all-to-all
             cu_seqlens = None
             seq_idx = None
         else:
             seq_len, batch, _ = hidden_states.shape
-            seq_len = seq_len * self.sp_size * self.cp_size
+            # Note: Only multiply by cp_size, NOT sp_size!
+            # The all-to-all (tensor_a2a_cp2hp) only gathers across CP ranks.
+            # SP-sharding is handled separately by Megatron's sequence parallel mechanism.
+            seq_len = seq_len * self.cp_size
             cu_seqlens = None
             cu_seqlens_global = None
             seq_idx = None
