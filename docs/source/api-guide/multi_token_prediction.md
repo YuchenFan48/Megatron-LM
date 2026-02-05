@@ -20,4 +20,29 @@ We can train GPTModel like models with Multi-Token Prediction (MTP) by setting m
 
 ## Precautions
 
-Please do not use Context Parallel (CP), or arbitrary AttnMaskType, or learned absolute position embedding type with MTP. These use cases are not yet supported.
+Please do not use Context Parallel (CP) with MTP. This use case is not yet supported.
+
+### Supported Position Embedding Types
+
+MTP supports the following position embedding types:
+- `rope` (Rotary Position Embedding) - Recommended
+- `learned_absolute` (Learned Absolute Position Embedding)
+- `none` (No position embedding)
+
+## Sliding Window Attention (SWA) Support
+
+MTP now supports Sliding Window Attention (SWA). When using SWA with MTP:
+
+- The `window_size` parameter from the main model config will be automatically applied to MTP layers.
+- The `window_attn_skip_freq` setting is also respected in MTP layers based on layer numbering.
+- Ensure that your window size is large enough to capture the necessary context for multi-token prediction.
+
+Example configuration:
+```python
+config = TransformerConfig(
+    ...
+    window_size=(4096, 0),  # Left window of 4096 tokens, causal (right window = 0)
+    window_attn_skip_freq=4,  # Every 4th layer uses full attention
+    mtp_num_layers=1,
+)
+```

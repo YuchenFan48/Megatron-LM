@@ -348,6 +348,11 @@ class KDA(MegatronModule):
         )
 
         self.reset_parameters()
+        print(f"[KDA] Layer {layer_number} initialized with Kimi Delta Attention (KDA)")
+
+    def _get_name(self):
+        """Return the name to display in model print/repr."""
+        return "KDA"
 
     def reset_parameters(self):
         """Reset the parameters."""
@@ -1656,3 +1661,4 @@ def torch_chunk_kda(
     
     final_state = h if output_final_state else None
     return output, final_state
+s

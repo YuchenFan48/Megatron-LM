@@ -1096,6 +1096,7 @@ class SelfAttention(Attention):
                 tp_comm_buffer_name='qkv',
                 tp_group=self.pg_collection.tp,
             )
+            print(f"[GatedAttention] Layer {layer_number} initialized with gated attention (linear_qgkv)")
         else:
             self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
             if self.config.attention_output_gate:

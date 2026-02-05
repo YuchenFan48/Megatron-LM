@@ -45,6 +45,7 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.causal,
     AttnMaskType.no_mask,
     AttnMaskType.padding_causal,
+    AttnMaskType.arbitrary,  # Required for Sliding Window Attention (SWA)
 ]
 
 try:
