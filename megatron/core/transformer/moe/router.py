@@ -40,6 +40,8 @@ class Router(ABC, MegatronModule):
         super().__init__(config)
         self.config = config
         self.num_experts = self.config.num_moe_experts
+        if config.num_zero_experts is not None:
+            self.num_experts += self.config.num_zero_experts
         self.moe_aux_loss_func = None
         self.layer_number = None
         self.tp_group = pg_collection.tp
@@ -50,11 +52,11 @@ class Router(ABC, MegatronModule):
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.
         self.weight = torch.nn.Parameter(
-            torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
+            torch.empty((self.num_experts, self.config.hidden_size), dtype=torch.float32)
         )
         if self.config.add_bias_linear:
             self.bias = torch.nn.Parameter(
-                torch.empty((self.config.num_moe_experts), dtype=torch.float32)
+                torch.empty((self.num_experts), dtype=torch.float32)
             )
         else:
             self.bias = None
@@ -163,7 +165,7 @@ class TopKRouter(Router):
             self.register_buffer(
                 'local_tokens_per_expert',
                 torch.zeros(
-                    self.config.num_moe_experts,
+                    self.num_experts,
                     dtype=torch.float32,
                     device=torch.cuda.current_device(),
                 ),
@@ -172,7 +174,7 @@ class TopKRouter(Router):
             self.register_buffer(
                 'expert_bias',
                 torch.zeros(
-                    self.config.num_moe_experts,
+                    self.num_experts,
                     dtype=torch.float32,
                     device=torch.cuda.current_device(),
                 ),
@@ -186,7 +188,7 @@ class TopKRouter(Router):
             self.register_buffer(
                 'global_tokens_per_expert',
                 torch.zeros(
-                    self.config.num_moe_experts,
+                    self.num_experts,
                     dtype=torch.float32,
                     device=torch.cuda.current_device(),
                 ),
@@ -289,7 +291,7 @@ class TopKRouter(Router):
             tokens_per_expert=tokens_per_expert,
             total_num_tokens=total_num_tokens,
             topk=self.topk,
-            num_experts=self.config.num_moe_experts,
+            num_experts=self.num_experts,
             moe_aux_loss_coeff=aux_loss_coeff,
             fused=self.config.moe_router_fusion,
         )
@@ -331,7 +333,7 @@ class TopKRouter(Router):
                 tokens_per_expert=tokens_per_expert,
                 total_num_tokens=total_num_tokens,
                 topk=self.topk,
-                num_experts=self.config.num_moe_experts,
+                num_experts=self.num_experts,
                 moe_aux_loss_coeff=seq_aux_loss_coeff,
                 fused=self.config.moe_router_fusion,
             )
@@ -367,7 +369,7 @@ class TopKRouter(Router):
             tokens_per_expert=averated_tokens_per_expert,
             total_num_tokens=total_num_tokens,
             topk=self.topk,
-            num_experts=self.config.num_moe_experts,
+            num_experts=self.num_experts,
             moe_aux_loss_coeff=global_aux_loss_coeff,
             fused=self.config.moe_router_fusion,
         )
@@ -494,7 +496,7 @@ class TopKRouter(Router):
                 with shape [num_tokens, num_experts].
         """
         seq_length, bsz = logits.shape[:2]
-        logits = logits.view(-1, self.config.num_moe_experts)
+        logits = logits.view(-1, self.num_experts)
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)

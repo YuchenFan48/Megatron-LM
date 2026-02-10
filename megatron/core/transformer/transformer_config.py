@@ -215,6 +215,9 @@ class TransformerConfig(ModelParallelConfig):
     use_gated_attention: bool = False
     """Whether to use gated attention as in Qwen3Next."""
 
+    num_zero_experts: Optional[int] = None
+    zero_experts_type: Optional[str] = None
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 

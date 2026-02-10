@@ -197,10 +197,19 @@ class MoELayer(BaseMoELayer):
         dispatcher. The original hidden states are returned as a residual connection.
         """
         residual = hidden_states
+
+        if self.config.num_zero_experts is not None:
+            zero_expert_weight = probs[:, self.config.num_moe_experts:].sum(dim=-1, keepdim=True) # Shape: [S*B, 1]
+            zero_expert_weight = zero_expert_weight.view(residual.shape[0], residual.shape[1], 1) # Reshape to [S, B, 1]
+            probs = probs[:, :self.config.num_moe_experts]
+            routing_map = routing_map[:, :self.config.num_moe_experts]
+        else:
+            zero_expert_weight = None
+
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
-        return hidden_states, probs, residual
+        return hidden_states, probs, residual, zero_expert_weight
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
@@ -296,7 +305,7 @@ class MoELayer(BaseMoELayer):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
                 probs, routing_map = self.route(hidden_states)
-                hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
+                hidden_states, probs, residual, zero_expert_weight = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
                 # It means we should early-return from the MoE layer forward pass.
@@ -308,6 +317,11 @@ class MoELayer(BaseMoELayer):
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
             output = self.combine(output, shared_expert_output)
+
+            if zero_expert_weight is not None:
+                if self.config.zero_experts_type == 'copy':
+                    output += zero_expert_weight * residual
+
             return output, mlp_bias
 
         if self.moe_layer_recompute:
